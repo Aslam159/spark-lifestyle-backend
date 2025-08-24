@@ -4,8 +4,6 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { format, startOfDay, endOfDay, addMinutes } = require('date-fns');
-// --- FINAL FIX: Revert to the general import path ---
-const { utcToZonedTime } = require('date-fns-tz');
 
 // ----- Firebase Configuration -----
 try {
@@ -63,25 +61,27 @@ app.get('/api/availability', async (req, res) => {
     return res.status(400).send({ error: 'Date query parameter is required.' });
   }
   try {
-    const timeZone = 'Africa/Johannesburg';
+    // --- FINAL TIMEZONE FIX: All calculations will be in UTC ---
     const requestedDate = new Date(`${date}T00:00:00.000Z`);
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
     
-    const openingTime = { hour: 8, minute: 0 };
-    const closingTime = { hour: 16, minute: 0 };
+    // Operating hours in SAST (UTC+2) converted to UTC
+    const openingHourUTC = 6; // 8 AM SAST
+    const closingHourUTC = 14; // 4 PM SAST
     const slotInterval = 15;
     
     const allSlots = [];
     let currentTime = new Date(startOfRequestedDay);
-    currentTime.setUTCHours(openingTime.hour, openingTime.minute, 0, 0);
+    currentTime.setUTCHours(openingHourUTC, 0, 0, 0);
     const closingDateTime = new Date(startOfRequestedDay);
-    closingDateTime.setUTCHours(closingTime.hour, closingTime.minute, 0, 0);
+    closingDateTime.setUTCHours(closingHourUTC, 0, 0, 0);
 
-    // Generate all slots and format them in the correct timezone
+    // Generate all slots and format them to SAST for the app
     while (currentTime < closingDateTime) {
-      const zonedTime = utcToZonedTime(currentTime, timeZone);
-      allSlots.push(format(zonedTime, 'HH:mm'));
+      // Add 2 hours to display the time in SAST
+      const sastTime = addMinutes(currentTime, 120);
+      allSlots.push(format(sastTime, 'HH:mm'));
       currentTime = addMinutes(currentTime, slotInterval);
     }
     
@@ -97,9 +97,9 @@ app.get('/api/availability', async (req, res) => {
       const numberOfSlotsToOccupy = Math.ceil(duration / slotInterval);
       let slotTime = new Date(bookingStartTime);
       for (let i = 0; i < numberOfSlotsToOccupy; i++) {
-        // Format occupied slots in the correct timezone for comparison
-        const zonedTime = utcToZonedTime(slotTime, timeZone);
-        occupiedSlots.add(format(zonedTime, 'HH:mm'));
+        // Add 2 hours to the booking time to match the SAST display format
+        const sastSlotTime = addMinutes(slotTime, 120);
+        occupiedSlots.add(format(sastSlotTime, 'HH:mm'));
         slotTime = addMinutes(slotTime, slotInterval);
       }
     }
