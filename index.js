@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { format, startOfDay, endOfDay, addMinutes } = require('date-fns');
+const { utcToZonedTime } = require('date-fns-tz'); // Re-added for timezone correction
 
 // ----- Firebase Configuration -----
 try {
@@ -61,14 +62,13 @@ app.get('/api/availability', async (req, res) => {
     return res.status(400).send({ error: 'Date query parameter is required.' });
   }
   try {
-    const requestedDate = new Date(`${date}T00:00:00.000Z`); // Treat date as UTC
+    const timeZone = 'Africa/Johannesburg';
+    const requestedDate = new Date(`${date}T00:00:00.000Z`);
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
     
-    console.log(`Querying for bookings between (UTC): ${startOfRequestedDay.toISOString()} and ${endOfRequestedDay.toISOString()}`);
-
-    const openingTime = { hour: 6, minute: 0 }; // 8 AM SAST is 6 AM UTC
-    const closingTime = { hour: 14, minute: 0 }; // 4 PM SAST is 2 PM (14:00) UTC
+    const openingTime = { hour: 8, minute: 0 };
+    const closingTime = { hour: 16, minute: 0 };
     const slotInterval = 15;
     
     const allSlots = [];
@@ -77,15 +77,15 @@ app.get('/api/availability', async (req, res) => {
     const closingDateTime = new Date(startOfRequestedDay);
     closingDateTime.setUTCHours(closingTime.hour, closingTime.minute, 0, 0);
 
-    // Generate all slots in UTC
+    // Generate all slots and format them in the correct timezone
     while (currentTime < closingDateTime) {
-      allSlots.push(format(currentTime, 'HH:mm'));
+      const zonedTime = utcToZonedTime(currentTime, timeZone);
+      allSlots.push(format(zonedTime, 'HH:mm'));
       currentTime = addMinutes(currentTime, slotInterval);
     }
     
     const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startOfRequestedDay).where('startTime', '<=', endOfRequestedDay).get();
-    console.log(`Firestore query found ${bookingsSnapshot.size} bookings for this date.`);
-
+    
     const occupiedSlots = new Set();
     for (const doc of bookingsSnapshot.docs) {
       const booking = doc.data();
@@ -96,8 +96,9 @@ app.get('/api/availability', async (req, res) => {
       const numberOfSlotsToOccupy = Math.ceil(duration / slotInterval);
       let slotTime = new Date(bookingStartTime);
       for (let i = 0; i < numberOfSlotsToOccupy; i++) {
-        // --- FINAL FIX: Format the UTC time directly without incorrect adjustments ---
-        occupiedSlots.add(format(slotTime, 'HH:mm'));
+        // Format occupied slots in the correct timezone for comparison
+        const zonedTime = utcToZonedTime(slotTime, timeZone);
+        occupiedSlots.add(format(zonedTime, 'HH:mm'));
         slotTime = addMinutes(slotTime, slotInterval);
       }
     }
