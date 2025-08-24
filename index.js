@@ -172,6 +172,6 @@ app.post('/api/bookings', async (req, res) => {
 
 
 // ----- Start Server -----
-app.listen(PORT, () => {
-  console.log(`Server is running successfully on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server is now listening on port ${PORT}`);
 });
