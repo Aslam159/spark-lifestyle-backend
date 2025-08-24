@@ -35,19 +35,15 @@ app.post('/auth/signup', async (req, res) => {
       password: password,
       displayName: name,
     });
-    console.log('Successfully created new user:', userRecord.uid);
     res.status(201).send({ uid: userRecord.uid });
   } catch (error) {
-    console.log('Error creating new user:', error.message);
     res.status(400).send({ error: error.message });
   }
 });
 
 app.get('/api/services', async (req, res) => {
   try {
-    console.log("Endpoint /api/services hit. Attempting to fetch from Firestore...");
     const servicesSnapshot = await db.collection('services').get();
-    console.log(`Firestore fetch successful. Found ${servicesSnapshot.size} services.`);
     const servicesList = [];
     servicesSnapshot.forEach((doc) => {
       servicesList.push({ id: doc.id, ...doc.data() });
@@ -59,46 +55,41 @@ app.get('/api/services', async (req, res) => {
   }
 });
 
-// Temporary Endpoint to Test Bookings
-app.get('/api/test-bookings', async (req, res) => {
-  try {
-    console.log("Endpoint /api/test-bookings hit. Attempting to fetch from Firestore...");
-    const bookingsSnapshot = await db.collection('bookings').get();
-    console.log(`Firestore fetch successful. Found ${bookingsSnapshot.size} bookings.`);
-    const bookingsList = [];
-    bookingsSnapshot.forEach((doc) => {
-      bookingsList.push({ id: doc.id, ...doc.data() });
-    });
-    res.status(200).send(bookingsList);
-  } catch (error)
- {
-    console.error("ERROR inside /api/test-bookings:", error);
-    res.status(500).send({ error: 'Failed to fetch bookings.' });
-  }
-});
-
 app.get('/api/availability', async (req, res) => {
   const { date } = req.query;
   if (!date) {
     return res.status(400).send({ error: 'Date query parameter is required.' });
   }
   try {
+    // --- ADDED DETAILED LOGGING ---
+    console.log(`Received date string from app: ${date}`);
     const requestedDate = new Date(`${date}T00:00:00`);
+    console.log(`Parsed date object on server (UTC): ${requestedDate.toISOString()}`);
+    
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
+    
+    console.log(`Querying for bookings between (UTC): ${startOfRequestedDay.toISOString()} and ${endOfRequestedDay.toISOString()}`);
+    // --- END OF LOGGING ---
+
     const openingTime = { hour: 8, minute: 0 };
     const closingTime = { hour: 16, minute: 0 };
     const slotInterval = 15;
+    
     const allSlots = [];
     let currentTime = new Date(startOfRequestedDay);
-    currentTime.setHours(openingTime.hour, openingTime.minute);
+    currentTime.setUTCHours(openingTime.hour, openingTime.minute, 0, 0); // Use UTC hours for server
     const closingDateTime = new Date(startOfRequestedDay);
-    closingDateTime.setHours(closingTime.hour, closingTime.minute);
+    closingDateTime.setUTCHours(closingTime.hour, closingTime.minute, 0, 0); // Use UTC hours for server
+
     while (currentTime < closingDateTime) {
       allSlots.push(format(currentTime, 'HH:mm'));
       currentTime = addMinutes(currentTime, slotInterval);
     }
+    
     const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startOfRequestedDay).where('startTime', '<=', endOfRequestedDay).get();
+    console.log(`Firestore query found ${bookingsSnapshot.size} bookings for this date.`);
+
     const occupiedSlots = new Set();
     for (const doc of bookingsSnapshot.docs) {
       const booking = doc.data();
