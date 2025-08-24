@@ -4,8 +4,8 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 const { format, startOfDay, endOfDay, addMinutes } = require('date-fns');
-// --- FINAL FIX: Use a more specific import path for the function ---
-const { utcToZonedTime } = require('date-fns-tz/utcToZonedTime');
+// --- FINAL FIX: Revert to the general import path ---
+const { utcToZonedTime } = require('date-fns-tz');
 
 // ----- Firebase Configuration -----
 try {
