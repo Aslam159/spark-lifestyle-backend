@@ -61,16 +61,12 @@ app.get('/api/availability', async (req, res) => {
     return res.status(400).send({ error: 'Date query parameter is required.' });
   }
   try {
-    // --- ADDED DETAILED LOGGING ---
-    console.log(`Received date string from app: ${date}`);
-    const requestedDate = new Date(`${date}T00:00:00`);
-    console.log(`Parsed date object on server (UTC): ${requestedDate.toISOString()}`);
-    
+    // --- FINAL TIMEZONE FIX ---
+    const requestedDate = new Date(`${date}T00:00:00.000Z`); // Treat date as UTC
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
     
     console.log(`Querying for bookings between (UTC): ${startOfRequestedDay.toISOString()} and ${endOfRequestedDay.toISOString()}`);
-    // --- END OF LOGGING ---
 
     const openingTime = { hour: 8, minute: 0 };
     const closingTime = { hour: 16, minute: 0 };
@@ -78,10 +74,11 @@ app.get('/api/availability', async (req, res) => {
     
     const allSlots = [];
     let currentTime = new Date(startOfRequestedDay);
-    currentTime.setUTCHours(openingTime.hour, openingTime.minute, 0, 0); // Use UTC hours for server
+    currentTime.setUTCHours(openingTime.hour, openingTime.minute, 0, 0);
     const closingDateTime = new Date(startOfRequestedDay);
-    closingDateTime.setUTCHours(closingTime.hour, closingTime.minute, 0, 0); // Use UTC hours for server
+    closingDateTime.setUTCHours(closingTime.hour, closingTime.minute, 0, 0);
 
+    // Generate all slots in UTC
     while (currentTime < closingDateTime) {
       allSlots.push(format(currentTime, 'HH:mm'));
       currentTime = addMinutes(currentTime, slotInterval);
@@ -100,7 +97,8 @@ app.get('/api/availability', async (req, res) => {
       const numberOfSlotsToOccupy = Math.ceil(duration / slotInterval);
       let slotTime = new Date(bookingStartTime);
       for (let i = 0; i < numberOfSlotsToOccupy; i++) {
-        occupiedSlots.add(format(slotTime, 'HH:mm'));
+        // Format the occupied slot time to UTC 'HH:mm' for correct comparison
+        occupiedSlots.add(format(new Date(slotTime.valueOf() + slotTime.getTimezoneOffset() * 60 * 1000), 'HH:mm'));
         slotTime = addMinutes(slotTime, slotInterval);
       }
     }
@@ -132,7 +130,7 @@ app.post('/api/bookings', async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating booking:', error);
-    res.status(500).send({ error: 'Failed to create booking.' });
+    res.status(500).send({ error: 'Failed to fetch booking.' });
   }
 });
 
@@ -140,3 +138,4 @@ app.post('/api/bookings', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
+
