@@ -61,15 +61,14 @@ app.get('/api/availability', async (req, res) => {
     return res.status(400).send({ error: 'Date query parameter is required.' });
   }
   try {
-    // --- FINAL TIMEZONE FIX ---
     const requestedDate = new Date(`${date}T00:00:00.000Z`); // Treat date as UTC
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
     
     console.log(`Querying for bookings between (UTC): ${startOfRequestedDay.toISOString()} and ${endOfRequestedDay.toISOString()}`);
 
-    const openingTime = { hour: 8, minute: 0 };
-    const closingTime = { hour: 16, minute: 0 };
+    const openingTime = { hour: 6, minute: 0 }; // 8 AM SAST is 6 AM UTC
+    const closingTime = { hour: 14, minute: 0 }; // 4 PM SAST is 2 PM (14:00) UTC
     const slotInterval = 15;
     
     const allSlots = [];
@@ -97,8 +96,8 @@ app.get('/api/availability', async (req, res) => {
       const numberOfSlotsToOccupy = Math.ceil(duration / slotInterval);
       let slotTime = new Date(bookingStartTime);
       for (let i = 0; i < numberOfSlotsToOccupy; i++) {
-        // Format the occupied slot time to UTC 'HH:mm' for correct comparison
-        occupiedSlots.add(format(new Date(slotTime.valueOf() + slotTime.getTimezoneOffset() * 60 * 1000), 'HH:mm'));
+        // --- FINAL FIX: Format the UTC time directly without incorrect adjustments ---
+        occupiedSlots.add(format(slotTime, 'HH:mm'));
         slotTime = addMinutes(slotTime, slotInterval);
       }
     }
