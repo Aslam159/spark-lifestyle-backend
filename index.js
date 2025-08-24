@@ -3,7 +3,7 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const { format, startOfDay, endOfDay, addMinutes } = require('date-fns');
+const { format, startOfDay, endOfDay, addMinutes, isSameDay, isBefore, startOfToday } = require('date-fns');
 
 // ----- Firebase Configuration -----
 try {
@@ -61,12 +61,16 @@ app.get('/api/availability', async (req, res) => {
     return res.status(400).send({ error: 'Date query parameter is required.' });
   }
   try {
-    // --- FINAL TIMEZONE FIX: All calculations will be in UTC ---
     const requestedDate = new Date(`${date}T00:00:00.000Z`);
+    
+    // --- NEW: Block all past dates ---
+    if (isBefore(requestedDate, startOfToday())) {
+      return res.status(200).send([]); // Return empty array for any past date
+    }
+
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
     
-    // Operating hours in SAST (UTC+2) converted to UTC
     const openingHourUTC = 6; // 8 AM SAST
     const closingHourUTC = 14; // 4 PM SAST
     const slotInterval = 15;
@@ -77,9 +81,7 @@ app.get('/api/availability', async (req, res) => {
     const closingDateTime = new Date(startOfRequestedDay);
     closingDateTime.setUTCHours(closingHourUTC, 0, 0, 0);
 
-    // Generate all slots and format them to SAST for the app
     while (currentTime < closingDateTime) {
-      // Add 2 hours to display the time in SAST
       const sastTime = addMinutes(currentTime, 120);
       allSlots.push(format(sastTime, 'HH:mm'));
       currentTime = addMinutes(currentTime, slotInterval);
@@ -97,13 +99,20 @@ app.get('/api/availability', async (req, res) => {
       const numberOfSlotsToOccupy = Math.ceil(duration / slotInterval);
       let slotTime = new Date(bookingStartTime);
       for (let i = 0; i < numberOfSlotsToOccupy; i++) {
-        // Add 2 hours to the booking time to match the SAST display format
         const sastSlotTime = addMinutes(slotTime, 120);
         occupiedSlots.add(format(sastSlotTime, 'HH:mm'));
         slotTime = addMinutes(slotTime, slotInterval);
       }
     }
-    const availableSlots = allSlots.filter(slot => !occupiedSlots.has(slot));
+    let availableSlots = allSlots.filter(slot => !occupiedSlots.has(slot));
+
+    // Filter out past time slots for the current day
+    const now = new Date();
+    if (isSameDay(requestedDate, now)) {
+      const currentTimeSAST = format(addMinutes(now, 120), 'HH:mm');
+      availableSlots = availableSlots.filter(slot => slot > currentTimeSAST);
+    }
+
     res.status(200).send(availableSlots);
   } catch (error) {
     console.error('Error fetching availability:', error);
