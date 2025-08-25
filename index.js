@@ -38,6 +38,17 @@ app.post('/auth/signup', async (req, res) => {
       password: password,
       displayName: name,
     });
+
+    // --- NEW: Create a user profile in Firestore for the loyalty program ---
+    const userProfile = {
+      email: userRecord.email,
+      name: userRecord.displayName,
+      loyaltyPoints: 0,
+      freeWashes: 0,
+    };
+    // The document ID will be the same as the user's authentication UID
+    await db.collection('users').doc(userRecord.uid).set(userProfile);
+
     res.status(201).send({ uid: userRecord.uid });
   } catch (error) {
     res.status(400).send({ error: error.message });
@@ -131,10 +142,34 @@ app.post('/api/bookings', async (req, res) => {
       userId,
       serviceId,
       startTime: new Date(startTime),
-      status: 'booked',
+      status: 'booked', // This could be 'paid' after payment integration
       createdAt: new Date(),
     };
     const docRef = await db.collection('bookings').add(newBooking);
+
+    // --- Award a loyalty point after successful booking ---
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+
+    if (userDoc.exists) {
+      const currentPoints = userDoc.data().loyaltyPoints || 0;
+      const newPoints = currentPoints + 1;
+
+      // --- UPDATED VALUE: Changed from 6 to 10 ---
+      if (newPoints >= 10) {
+        // User earned a free wash! Reset points and add a free wash credit.
+        await userRef.update({
+          loyaltyPoints: 0,
+          freeWashes: admin.firestore.FieldValue.increment(1),
+        });
+        console.log(`User ${userId} earned a free wash.`);
+      } else {
+        // Just update the points
+        await userRef.update({ loyaltyPoints: newPoints });
+        console.log(`User ${userId} now has ${newPoints} points.`);
+      }
+    }
+
     res.status(201).send({
       message: 'Booking created successfully!',
       bookingId: docRef.id,
@@ -149,6 +184,7 @@ app.post('/api/bookings', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
+
 
 
 
