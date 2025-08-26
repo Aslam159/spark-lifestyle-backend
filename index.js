@@ -6,15 +6,7 @@ const admin = require('firebase-admin');
 const { format, startOfDay, endOfDay, addMinutes, isSameDay, isBefore, startOfToday } = require('date-fns');
 const axios = require('axios');
 
-// ----- App Configuration -----
-const app = express();
-app.use(cors());
-app.use(express.json());
-const PORT = process.env.PORT || 3001;
-
-// ----- Firebase Initialization -----
-// This block is now more robust to prevent crashes.
-let db;
+// ----- Firebase Configuration -----
 try {
   const serviceAccount = require('./serviceAccountKey.json');
   if (!admin.apps.length) {
@@ -23,14 +15,16 @@ try {
     });
     console.log("Firebase Admin SDK initialized successfully.");
   }
-  db = admin.firestore();
 } catch (e) {
-  console.error("CRITICAL: Firebase Admin SDK initialization failed. This is likely due to a missing or misconfigured serviceAccountKey.json file in your Render environment variables.", e);
-  // If Firebase fails to init, we can't connect to the DB.
-  // We'll set db to null and handle it in the endpoints.
-  db = null;
+  console.error("CRITICAL: Firebase Admin SDK initialization failed!", e);
 }
+const db = admin.firestore();
 
+// ----- App Configuration -----
+const app = express();
+app.use(cors());
+app.use(express.json());
+const PORT = process.env.PORT || 3001;
 
 // --- Paystack Credentials ---
 const PAYSTACK_SECRET_KEY = 'sk_test_c75e440a7b40c66a47a8ab73605ec0ac3cdbaece';
@@ -41,19 +35,20 @@ const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify/';
 
 app.get('/', (req, res) => res.send('Welcome API!'));
 
-// Middleware to check if Firebase is available
-const checkFirebase = (req, res, next) => {
-  if (!db) {
-    return res.status(500).send({ error: 'The server is not connected to the database. Please check the server logs.' });
-  }
-  next();
-};
-
-app.post('/auth/signup', checkFirebase, async (req, res) => {
+app.post('/auth/signup', async (req, res) => {
   try {
     const { email, password, name } = req.body;
-    const userRecord = await admin.auth().createUser({ email, password, displayName: name });
-    const userProfile = { email: userRecord.email, name: userRecord.displayName, loyaltyPoints: 0, freeWashes: 0 };
+    const userRecord = await admin.auth().createUser({
+      email: email,
+      password: password,
+      displayName: name,
+    });
+    const userProfile = {
+      email: userRecord.email,
+      name: userRecord.displayName,
+      loyaltyPoints: 0,
+      freeWashes: 0,
+    };
     await db.collection('users').doc(userRecord.uid).set(userProfile);
     res.status(201).send({ uid: userRecord.uid });
   } catch (error) {
@@ -61,10 +56,13 @@ app.post('/auth/signup', checkFirebase, async (req, res) => {
   }
 });
 
-app.get('/api/services', checkFirebase, async (req, res) => {
+app.get('/api/services', async (req, res) => {
   try {
     const servicesSnapshot = await db.collection('services').get();
-    const servicesList = servicesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const servicesList = [];
+    servicesSnapshot.forEach((doc) => {
+      servicesList.push({ id: doc.id, ...doc.data() });
+    });
     res.status(200).send(servicesList);
   } catch (error) {
     console.error("Error in /api/services:", error);
@@ -72,7 +70,7 @@ app.get('/api/services', checkFirebase, async (req, res) => {
   }
 });
 
-app.get('/api/availability', checkFirebase, async (req, res) => {
+app.get('/api/availability', async (req, res) => {
   const { date } = req.query;
   if (!date) {
     return res.status(400).send({ error: 'Date query parameter is required.' });
@@ -82,6 +80,8 @@ app.get('/api/availability', checkFirebase, async (req, res) => {
     if (isBefore(requestedDate, startOfToday())) {
       return res.status(200).send([]);
     }
+    const settingsDoc = await db.collection('settings').doc('washSettings').get();
+    const activeBays = settingsDoc.exists ? settingsDoc.data().activeBays : 1;
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
     const openingHourUTC = 6;
@@ -98,7 +98,7 @@ app.get('/api/availability', checkFirebase, async (req, res) => {
       currentTime = addMinutes(currentTime, slotInterval);
     }
     const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startOfRequestedDay).where('startTime', '<=', endOfRequestedDay).get();
-    const occupiedSlots = new Set();
+    const occupiedSlotCounts = {};
     for (const doc of bookingsSnapshot.docs) {
       const booking = doc.data();
       const bookingStartTime = booking.startTime.toDate();
@@ -109,11 +109,12 @@ app.get('/api/availability', checkFirebase, async (req, res) => {
       let slotTime = new Date(bookingStartTime);
       for (let i = 0; i < numberOfSlotsToOccupy; i++) {
         const sastSlotTime = addMinutes(slotTime, 120);
-        occupiedSlots.add(format(sastSlotTime, 'HH:mm'));
+        const formattedSlot = format(sastSlotTime, 'HH:mm');
+        occupiedSlotCounts[formattedSlot] = (occupiedSlotCounts[formattedSlot] || 0) + 1;
         slotTime = addMinutes(slotTime, slotInterval);
       }
     }
-    let availableSlots = allSlots.filter(slot => !occupiedSlots.has(slot));
+    let availableSlots = allSlots.filter(slot => (occupiedSlotCounts[slot] || 0) < activeBays);
     const now = new Date();
     if (isSameDay(requestedDate, now)) {
       const currentTimeSAST = format(addMinutes(now, 120), 'HH:mm');
@@ -121,7 +122,7 @@ app.get('/api/availability', checkFirebase, async (req, res) => {
     }
     res.status(200).send(availableSlots);
   } catch (error) {
-    console.error('Error in /api/availability:', error);
+    console.error('Error fetching availability:', error);
     res.status(500).send({ error: 'Failed to fetch availability.' });
   }
 });
@@ -151,7 +152,7 @@ app.post('/api/payments/checkout', async (req, res) => {
   }
 });
 
-app.get('/api/payments/verify/:reference', checkFirebase, async (req, res) => {
+app.get('/api/payments/verify/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
     const config = { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } };
@@ -163,13 +164,27 @@ app.get('/api/payments/verify/:reference', checkFirebase, async (req, res) => {
   }
 });
 
-app.post('/api/bookings', checkFirebase, async (req, res) => {
+app.post('/api/bookings', async (req, res) => {
   try {
     const { userId, serviceId, startTime } = req.body;
     if (!userId || !serviceId || !startTime) {
       return res.status(400).send({ error: 'Missing required booking information.' });
     }
-    const newBooking = { userId, serviceId, startTime: new Date(startTime), status: 'paid', createdAt: new Date() };
+    const requestedStartTime = new Date(startTime);
+    const settingsDoc = await db.collection('settings').doc('washSettings').get();
+    const activeBays = settingsDoc.exists ? settingsDoc.data().activeBays : 1;
+    const existingBookings = await db.collection('bookings').where('startTime', '==', requestedStartTime).get();
+    if (existingBookings.size >= activeBays) {
+      return res.status(409).send({ error: 'Sorry, this time slot was just taken. Please select another time.' });
+    }
+    const newBooking = {
+      userId,
+      serviceId,
+      startTime: requestedStartTime,
+      status: 'paid',
+      createdAt: new Date(),
+      bayId: (existingBookings.size + 1)
+    };
     const docRef = await db.collection('bookings').add(newBooking);
     const userRef = db.collection('users').doc(userId);
     const userDoc = await userRef.get();
@@ -177,12 +192,18 @@ app.post('/api/bookings', checkFirebase, async (req, res) => {
       const currentPoints = userDoc.data().loyaltyPoints || 0;
       const newPoints = currentPoints + 1;
       if (newPoints >= 10) {
-        await userRef.update({ loyaltyPoints: 0, freeWashes: admin.firestore.FieldValue.increment(1) });
+        await userRef.update({
+          loyaltyPoints: 0,
+          freeWashes: admin.firestore.FieldValue.increment(1),
+        });
       } else {
         await userRef.update({ loyaltyPoints: newPoints });
       }
     }
-    res.status(201).send({ message: 'Booking created successfully!', bookingId: docRef.id });
+    res.status(201).send({
+      message: 'Booking created successfully!',
+      bookingId: docRef.id,
+    });
   } catch (error) {
     console.error('Error creating booking:', error);
     res.status(500).send({ error: 'Failed to create booking.' });
@@ -193,8 +214,3 @@ app.post('/api/bookings', checkFirebase, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
-
-
-
-
-
