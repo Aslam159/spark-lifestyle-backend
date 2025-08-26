@@ -95,7 +95,6 @@ app.get('/api/availability', async (req, res) => {
   try {
     const requestedDate = new Date(`${date}T00:00:00.000Z`);
     if (isBefore(requestedDate, startOfToday())) { return res.status(200).send([]); }
-    
     const dailySettingDoc = await db.collection('dailySettings').doc(date).get();
     let activeBays;
     if (dailySettingDoc.exists) {
@@ -104,11 +103,9 @@ app.get('/api/availability', async (req, res) => {
         const globalSettingsDoc = await db.collection('settings').doc('washSettings').get();
         activeBays = globalSettingsDoc.exists ? globalSettingsDoc.data().activeBays : 1;
     }
-
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
     const openingHourUTC = 6, closingHourUTC = 14, slotInterval = 15;
-    
     const allSlots = [];
     let currentTime = new Date(startOfRequestedDay);
     currentTime.setUTCHours(openingHourUTC, 0, 0, 0);
@@ -118,7 +115,6 @@ app.get('/api/availability', async (req, res) => {
       allSlots.push(format(addMinutes(currentTime, 120), 'HH:mm'));
       currentTime = addMinutes(currentTime, slotInterval);
     }
-
     const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startOfRequestedDay).where('startTime', '<=', endOfRequestedDay).get();
     const occupiedSlotCounts = {};
     for (const doc of bookingsSnapshot.docs) {
@@ -133,14 +129,11 @@ app.get('/api/availability', async (req, res) => {
         slotTime = addMinutes(slotTime, slotInterval);
       }
     }
-
     const blockedSlotsSnapshot = await db.collection('blockedSlots').where('date', '==', date).get();
     const blockedSlots = new Set(blockedSlotsSnapshot.docs.map(doc => doc.data().slot));
-
     let availableSlots = allSlots.filter(slot => 
         ((occupiedSlotCounts[slot] || 0) < activeBays) && !blockedSlots.has(slot)
     );
-
     if (isSameDay(requestedDate, new Date())) {
       const currentTimeSAST = format(addMinutes(new Date(), 120), 'HH:mm');
       availableSlots = availableSlots.filter(slot => slot > currentTimeSAST);
@@ -230,36 +223,34 @@ app.get('/api/manager/bookings', isManager, async (req, res) => {
   }
 });
 
-// --- NEW: Manager endpoint for monthly booking summary ---
 app.get('/api/manager/bookings/summary', isManager, async (req, res) => {
-    const { month, year } = req.query; // e.g., month=8, year=2025
+    const { month, year } = req.query;
     if (!month || !year) {
         return res.status(400).send({ error: 'Month and year are required.' });
     }
-
     try {
         const startDate = startOfMonth(new Date(year, month - 1, 1));
         const endDate = endOfMonth(startDate);
-
-        const bookingsSnapshot = await db.collection('bookings')
-            .where('startTime', '>=', startDate)
-            .where('startTime', '<=', endDate)
-            .get();
-
-        const counts = {};
-        bookingsSnapshot.forEach(doc => {
+        const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startDate).where('startTime', '<=', endDate).get();
+        const serviceCounts = {};
+        await Promise.all(bookingsSnapshot.docs.map(async (doc) => {
             const booking = doc.data();
-            const dateKey = format(booking.startTime.toDate(), 'yyyy-MM-dd');
-            counts[dateKey] = (counts[dateKey] || 0) + 1;
-        });
-
-        res.status(200).send(counts);
+            const serviceDoc = await db.collection('services').doc(booking.serviceId).get();
+            if (serviceDoc.exists) {
+                const serviceName = serviceDoc.data().name;
+                serviceCounts[serviceName] = (serviceCounts[serviceName] || 0) + 1;
+            }
+        }));
+        const summaryArray = Object.keys(serviceCounts).map(serviceName => ({
+            serviceName,
+            count: serviceCounts[serviceName]
+        }));
+        res.status(200).send(summaryArray);
     } catch (error) {
         console.error('[Manager] Error fetching booking summary:', error);
         res.status(500).send({ error: 'Failed to fetch booking summary.' });
     }
 });
-
 
 app.get('/api/manager/settings', isManager, async (req, res) => {
     const { date } = req.query;
@@ -323,5 +314,7 @@ app.post('/api/manager/blocked-slots', isManager, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
+
+
 
 
