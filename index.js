@@ -27,8 +27,8 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 
 // --- Paystack Credentials ---
-// Remember to replace this with your actual test key
-const PAYSTACK_SECRET_KEY = 'YOUR_PAYSTACK_TEST_SECRET_KEY';
+// Your actual test key has been added here.
+const PAYSTACK_SECRET_KEY = 'sk_test_c75e440a7b40c66a47a8ab73605ec0ac3cdbaece';
 const PAYSTACK_API_URL = 'https://api.paystack.co/transaction/initialize';
 
 // ----- API Endpoints -----
@@ -188,6 +188,7 @@ app.post('/api/bookings', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
+
 
 
 
