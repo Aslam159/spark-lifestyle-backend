@@ -3,7 +3,7 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const { format, startOfDay, endOfDay, addMinutes, isSameDay, isBefore, startOfToday } = require('date-fns');
+const { format, startOfDay, endOfDay, addMinutes, isSameDay, isBefore, startOfToday, startOfMonth, endOfMonth } = require('date-fns');
 const axios = require('axios');
 
 // ----- Firebase Configuration -----
@@ -229,6 +229,37 @@ app.get('/api/manager/bookings', isManager, async (req, res) => {
     res.status(500).send({ error: 'Failed to fetch bookings.' });
   }
 });
+
+// --- NEW: Manager endpoint for monthly booking summary ---
+app.get('/api/manager/bookings/summary', isManager, async (req, res) => {
+    const { month, year } = req.query; // e.g., month=8, year=2025
+    if (!month || !year) {
+        return res.status(400).send({ error: 'Month and year are required.' });
+    }
+
+    try {
+        const startDate = startOfMonth(new Date(year, month - 1, 1));
+        const endDate = endOfMonth(startDate);
+
+        const bookingsSnapshot = await db.collection('bookings')
+            .where('startTime', '>=', startDate)
+            .where('startTime', '<=', endDate)
+            .get();
+
+        const counts = {};
+        bookingsSnapshot.forEach(doc => {
+            const booking = doc.data();
+            const dateKey = format(booking.startTime.toDate(), 'yyyy-MM-dd');
+            counts[dateKey] = (counts[dateKey] || 0) + 1;
+        });
+
+        res.status(200).send(counts);
+    } catch (error) {
+        console.error('[Manager] Error fetching booking summary:', error);
+        res.status(500).send({ error: 'Failed to fetch booking summary.' });
+    }
+});
+
 
 app.get('/api/manager/settings', isManager, async (req, res) => {
     const { date } = req.query;
