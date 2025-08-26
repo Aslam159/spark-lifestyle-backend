@@ -54,60 +54,160 @@ const isManager = async (req, res, next) => {
 
 app.get('/', (req, res) => res.send('Welcome API!'));
 
-// ... (your existing signup, services, availability, payment, and booking endpoints)
-app.post('/auth/signup', async (req, res) => { /* ... */ });
-app.post('/api/assign-manager-role', async (req, res) => { /* ... */ });
-app.get('/api/services', async (req, res) => { /* ... */ });
-app.get('/api/availability', async (req, res) => { /* ... */ });
-app.post('/api/payments/checkout', async (req, res) => { /* ... */ });
-app.get('/api/payments/verify/:reference', async (req, res) => { /* ... */ });
-app.post('/api/bookings', async (req, res) => { /* ... */ });
+app.post('/auth/signup', async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    const userRecord = await admin.auth().createUser({ email, password, displayName: name });
+    const userProfile = { email: userRecord.email, name: userRecord.displayName, loyaltyPoints: 0, freeWashes: 0, role: 'customer' };
+    await db.collection('users').doc(userRecord.uid).set(userProfile);
+    res.status(201).send({ uid: userRecord.uid });
+  } catch (error) {
+    res.status(400).send({ error: error.message });
+  }
+});
 
+app.post('/api/assign-manager-role', async (req, res) => {
+    const { email } = req.body;
+    if (!email) {
+        return res.status(400).send({ error: 'Email is required.' });
+    }
+    try {
+        const user = await admin.auth().getUserByEmail(email);
+        await admin.auth().setCustomUserClaims(user.uid, { role: 'manager' });
+        await db.collection('users').doc(user.uid).update({ role: 'manager' });
+        res.status(200).send({ message: `Successfully assigned manager role to ${email}` });
+    } catch (error) {
+        res.status(500).send({ error: 'Could not assign manager role.' });
+    }
+});
 
-// --- UPDATED: Manager-only endpoint with detailed logging ---
+app.get('/api/services', async (req, res) => {
+  try {
+    const servicesSnapshot = await db.collection('services').get();
+    const servicesList = servicesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.status(200).send(servicesList);
+  } catch (error) {
+    res.status(500).send({ error: 'Failed to fetch services.' });
+  }
+});
+
+app.get('/api/availability', async (req, res) => {
+  const { date } = req.query;
+  if (!date) { return res.status(400).send({ error: 'Date query is required.' }); }
+  try {
+    const requestedDate = new Date(`${date}T00:00:00.000Z`);
+    if (isBefore(requestedDate, startOfToday())) { return res.status(200).send([]); }
+    const settingsDoc = await db.collection('settings').doc('washSettings').get();
+    const activeBays = settingsDoc.exists ? settingsDoc.data().activeBays : 1;
+    const startOfRequestedDay = startOfDay(requestedDate);
+    const endOfRequestedDay = endOfDay(requestedDate);
+    const openingHourUTC = 6, closingHourUTC = 14, slotInterval = 15;
+    const allSlots = [];
+    let currentTime = new Date(startOfRequestedDay);
+    currentTime.setUTCHours(openingHourUTC, 0, 0, 0);
+    const closingDateTime = new Date(startOfRequestedDay);
+    closingDateTime.setUTCHours(closingHourUTC, 0, 0, 0);
+    while (currentTime < closingDateTime) {
+      allSlots.push(format(addMinutes(currentTime, 120), 'HH:mm'));
+      currentTime = addMinutes(currentTime, slotInterval);
+    }
+    const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startOfRequestedDay).where('startTime', '<=', endOfRequestedDay).get();
+    const occupiedSlotCounts = {};
+    for (const doc of bookingsSnapshot.docs) {
+      const booking = doc.data();
+      const serviceDoc = await db.collection('services').doc(booking.serviceId).get();
+      if (!serviceDoc.exists) continue;
+      const duration = serviceDoc.data().durationInMinutes;
+      let slotTime = booking.startTime.toDate();
+      for (let i = 0; i < Math.ceil(duration / slotInterval); i++) {
+        const formattedSlot = format(addMinutes(slotTime, 120), 'HH:mm');
+        occupiedSlotCounts[formattedSlot] = (occupiedSlotCounts[formattedSlot] || 0) + 1;
+        slotTime = addMinutes(slotTime, slotInterval);
+      }
+    }
+    let availableSlots = allSlots.filter(slot => (occupiedSlotCounts[slot] || 0) < activeBays);
+    if (isSameDay(requestedDate, new Date())) {
+      const currentTimeSAST = format(addMinutes(new Date(), 120), 'HH:mm');
+      availableSlots = availableSlots.filter(slot => slot > currentTimeSAST);
+    }
+    res.status(200).send(availableSlots);
+  } catch (error) {
+    res.status(500).send({ error: 'Failed to fetch availability.' });
+  }
+});
+
+app.post('/api/payments/checkout', async (req, res) => {
+  try {
+    const { amount, email } = req.body;
+    const amountInCents = Math.round(amount * 100);
+    const data = { email, amount: amountInCents, currency: 'ZAR' };
+    const config = { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } };
+    const paystackResponse = await axios.post(PAYSTACK_API_URL, data, config);
+    res.status(200).send({ authorization_url: paystackResponse.data.data.authorization_url, reference: paystackResponse.data.data.reference });
+  } catch (error) {
+    res.status(500).send({ error: 'Failed to initialize payment.' });
+  }
+});
+
+app.get('/api/payments/verify/:reference', async (req, res) => {
+  try {
+    const { reference } = req.params;
+    const config = { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } };
+    const paystackResponse = await axios.get(`${PAYSTACK_VERIFY_URL}${reference}`, config);
+    res.status(200).send({ status: paystackResponse.data.data.status });
+  } catch (error) {
+    res.status(500).send({ error: 'Failed to verify payment.' });
+  }
+});
+
+app.post('/api/bookings', async (req, res) => {
+  try {
+    const { userId, serviceId, startTime } = req.body;
+    const correctUTCTime = addMinutes(new Date(startTime), -120);
+    const settingsDoc = await db.collection('settings').doc('washSettings').get();
+    const activeBays = settingsDoc.exists ? settingsDoc.data().activeBays : 1;
+    const existingBookings = await db.collection('bookings').where('startTime', '==', correctUTCTime).get();
+    if (existingBookings.size >= activeBays) {
+      return res.status(409).send({ error: 'Sorry, this time slot was just taken. Please select another time.' });
+    }
+    const newBooking = { userId, serviceId, startTime: correctUTCTime, status: 'paid', createdAt: new Date(), bayId: (existingBookings.size + 1) };
+    const docRef = await db.collection('bookings').add(newBooking);
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+    if (userDoc.exists) {
+      const newPoints = (userDoc.data().loyaltyPoints || 0) + 1;
+      if (newPoints >= 10) {
+        await userRef.update({ loyaltyPoints: 0, freeWashes: admin.firestore.FieldValue.increment(1) });
+      } else {
+        await userRef.update({ loyaltyPoints: newPoints });
+      }
+    }
+    res.status(201).send({ message: 'Booking created successfully!', bookingId: docRef.id });
+  } catch (error) {
+    res.status(500).send({ error: 'Failed to create booking.' });
+  }
+});
+
 app.get('/api/manager/bookings', isManager, async (req, res) => {
   const { date } = req.query;
-  console.log(`[Manager] Received request for bookings on date: ${date}`);
-  if (!date) {
-    return res.status(400).send({ error: 'Date query parameter is required.' });
-  }
+  if (!date) { return res.status(400).send({ error: 'Date query parameter is required.' }); }
   try {
     const requestedDate = new Date(`${date}T00:00:00.000Z`);
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
-
-    console.log(`[Manager] Querying bookings between ${startOfRequestedDay.toISOString()} and ${endOfRequestedDay.toISOString()}`);
-    const bookingsSnapshot = await db.collection('bookings')
-      .where('startTime', '>=', startOfRequestedDay)
-      .where('startTime', '<=', endOfRequestedDay)
-      .orderBy('startTime', 'asc')
-      .get();
-    console.log(`[Manager] Found ${bookingsSnapshot.size} bookings.`);
-
+    const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startOfRequestedDay).where('startTime', '<=', endOfRequestedDay).orderBy('startTime', 'asc').get();
     const detailedBookings = await Promise.all(bookingsSnapshot.docs.map(async (doc) => {
       const booking = doc.data();
-      console.log(`[Manager] Processing booking ID: ${doc.id}`);
-      
-      console.log(`[Manager] Fetching user: ${booking.userId}`);
       const userDoc = await db.collection('users').doc(booking.userId).get();
-      const userName = userDoc.exists ? userDoc.data().name : 'Unknown User';
-
-      console.log(`[Manager] Fetching service: ${booking.serviceId}`);
       const serviceDoc = await db.collection('services').doc(booking.serviceId).get();
-      const serviceName = serviceDoc.exists ? serviceDoc.data().name : 'Unknown Service';
-
-      const sastTime = addMinutes(booking.startTime.toDate(), 120);
-
       return {
         id: doc.id,
         ...booking,
-        userName,
-        serviceName,
-        startTimeSAST: format(sastTime, 'HH:mm'),
+        userName: userDoc.exists ? userDoc.data().name : 'Unknown User',
+        serviceName: serviceDoc.exists ? serviceDoc.data().name : 'Unknown Service',
+        startTimeSAST: format(addMinutes(booking.startTime.toDate(), 120), 'HH:mm'),
       };
     }));
-
-    console.log("[Manager] Successfully processed all bookings. Sending response.");
     res.status(200).send(detailedBookings);
   } catch (error) {
     console.error('[Manager] CRITICAL ERROR fetching manager bookings:', error);
@@ -116,13 +216,31 @@ app.get('/api/manager/bookings', isManager, async (req, res) => {
 });
 
 app.get('/api/manager/settings', isManager, async (req, res) => {
-    // ... (existing settings code)
+    const { date } = req.query;
+    if (!date) { return res.status(400).send({ error: "Date is required." }); }
+    try {
+        const dailySettingDoc = await db.collection('dailySettings').doc(date).get();
+        if (dailySettingDoc.exists) { return res.status(200).send(dailySettingDoc.data()); }
+        const globalSettingsDoc = await db.collection('settings').doc('washSettings').get();
+        if (!globalSettingsDoc.exists) { return res.status(404).send({ error: 'Default settings not found.' }); }
+        res.status(200).send(globalSettingsDoc.data());
+    } catch (error) {
+        res.status(500).send({ error: 'Failed to fetch settings.' });
+    }
 });
 
 app.post('/api/manager/settings/activeBays', isManager, async (req, res) => {
-    // ... (existing settings update code)
+    const { count, date } = req.body;
+    if (typeof count !== 'number' || (count !== 1 && count !== 2) || !date) {
+        return res.status(400).send({ error: 'Invalid count or date provided.' });
+    }
+    try {
+        await db.collection('dailySettings').doc(date).set({ activeBays: count });
+        res.status(200).send({ message: `Active bays for ${date} successfully set to ${count}.` });
+    } catch (error) {
+        res.status(500).send({ error: 'Failed to update settings.' });
+    }
 });
-
 
 // ----- Start Server -----
 app.listen(PORT, '0.0.0.0', () => {
