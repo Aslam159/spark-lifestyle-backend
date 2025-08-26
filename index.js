@@ -6,24 +6,31 @@ const admin = require('firebase-admin');
 const { format, startOfDay, endOfDay, addMinutes, isSameDay, isBefore, startOfToday } = require('date-fns');
 const axios = require('axios');
 
-// ----- Firebase Configuration -----
+// ----- App Configuration -----
+const app = express();
+app.use(cors());
+app.use(express.json());
+const PORT = process.env.PORT || 3001;
+
+// ----- Firebase Initialization -----
+// This block is now more robust to prevent crashes.
+let db;
 try {
   const serviceAccount = require('./serviceAccountKey.json');
   if (!admin.apps.length) {
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
     });
+    console.log("Firebase Admin SDK initialized successfully.");
   }
+  db = admin.firestore();
 } catch (e) {
-  console.error("CRITICAL: Firebase Admin SDK initialization failed!", e);
+  console.error("CRITICAL: Firebase Admin SDK initialization failed. This is likely due to a missing or misconfigured serviceAccountKey.json file in your Render environment variables.", e);
+  // If Firebase fails to init, we can't connect to the DB.
+  // We'll set db to null and handle it in the endpoints.
+  db = null;
 }
-const db = admin.firestore();
 
-// ----- App Configuration -----
-const app = express();
-app.use(cors());
-app.use(express.json());
-const PORT = process.env.PORT || 3001;
 
 // --- Paystack Credentials ---
 const PAYSTACK_SECRET_KEY = 'sk_test_c75e440a7b40c66a47a8ab73605ec0ac3cdbaece';
@@ -34,10 +41,90 @@ const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify/';
 
 app.get('/', (req, res) => res.send('Welcome API!'));
 
-// ... (your existing signup, services, and availability endpoints)
-app.post('/auth/signup', async (req, res) => { /* ... */ });
-app.get('/api/services', async (req, res) => { /* ... */ });
-app.get('/api/availability', async (req, res) => { /* ... */ });
+// Middleware to check if Firebase is available
+const checkFirebase = (req, res, next) => {
+  if (!db) {
+    return res.status(500).send({ error: 'The server is not connected to the database. Please check the server logs.' });
+  }
+  next();
+};
+
+app.post('/auth/signup', checkFirebase, async (req, res) => {
+  try {
+    const { email, password, name } = req.body;
+    const userRecord = await admin.auth().createUser({ email, password, displayName: name });
+    const userProfile = { email: userRecord.email, name: userRecord.displayName, loyaltyPoints: 0, freeWashes: 0 };
+    await db.collection('users').doc(userRecord.uid).set(userProfile);
+    res.status(201).send({ uid: userRecord.uid });
+  } catch (error) {
+    res.status(400).send({ error: error.message });
+  }
+});
+
+app.get('/api/services', checkFirebase, async (req, res) => {
+  try {
+    const servicesSnapshot = await db.collection('services').get();
+    const servicesList = servicesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.status(200).send(servicesList);
+  } catch (error) {
+    console.error("Error in /api/services:", error);
+    res.status(500).send({ error: 'Failed to fetch services.' });
+  }
+});
+
+app.get('/api/availability', checkFirebase, async (req, res) => {
+  const { date } = req.query;
+  if (!date) {
+    return res.status(400).send({ error: 'Date query parameter is required.' });
+  }
+  try {
+    const requestedDate = new Date(`${date}T00:00:00.000Z`);
+    if (isBefore(requestedDate, startOfToday())) {
+      return res.status(200).send([]);
+    }
+    const startOfRequestedDay = startOfDay(requestedDate);
+    const endOfRequestedDay = endOfDay(requestedDate);
+    const openingHourUTC = 6;
+    const closingHourUTC = 14;
+    const slotInterval = 15;
+    const allSlots = [];
+    let currentTime = new Date(startOfRequestedDay);
+    currentTime.setUTCHours(openingHourUTC, 0, 0, 0);
+    const closingDateTime = new Date(startOfRequestedDay);
+    closingDateTime.setUTCHours(closingHourUTC, 0, 0, 0);
+    while (currentTime < closingDateTime) {
+      const sastTime = addMinutes(currentTime, 120);
+      allSlots.push(format(sastTime, 'HH:mm'));
+      currentTime = addMinutes(currentTime, slotInterval);
+    }
+    const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startOfRequestedDay).where('startTime', '<=', endOfRequestedDay).get();
+    const occupiedSlots = new Set();
+    for (const doc of bookingsSnapshot.docs) {
+      const booking = doc.data();
+      const bookingStartTime = booking.startTime.toDate();
+      const serviceDoc = await db.collection('services').doc(booking.serviceId).get();
+      if (!serviceDoc.exists) continue;
+      const duration = serviceDoc.data().durationInMinutes;
+      const numberOfSlotsToOccupy = Math.ceil(duration / slotInterval);
+      let slotTime = new Date(bookingStartTime);
+      for (let i = 0; i < numberOfSlotsToOccupy; i++) {
+        const sastSlotTime = addMinutes(slotTime, 120);
+        occupiedSlots.add(format(sastSlotTime, 'HH:mm'));
+        slotTime = addMinutes(slotTime, slotInterval);
+      }
+    }
+    let availableSlots = allSlots.filter(slot => !occupiedSlots.has(slot));
+    const now = new Date();
+    if (isSameDay(requestedDate, now)) {
+      const currentTimeSAST = format(addMinutes(now, 120), 'HH:mm');
+      availableSlots = availableSlots.filter(slot => slot > currentTimeSAST);
+    }
+    res.status(200).send(availableSlots);
+  } catch (error) {
+    console.error('Error in /api/availability:', error);
+    res.status(500).send({ error: 'Failed to fetch availability.' });
+  }
+});
 
 app.post('/api/payments/checkout', async (req, res) => {
   try {
@@ -56,7 +143,7 @@ app.post('/api/payments/checkout', async (req, res) => {
     const paystackResponse = await axios.post(PAYSTACK_API_URL, data, config);
     res.status(200).send({
       authorization_url: paystackResponse.data.data.authorization_url,
-      reference: paystackResponse.data.data.reference, // Send the reference back
+      reference: paystackResponse.data.data.reference,
     });
   } catch (error) {
     console.error("Error creating Paystack transaction:", error.response?.data || error.message);
@@ -64,15 +151,10 @@ app.post('/api/payments/checkout', async (req, res) => {
   }
 });
 
-// --- NEW: Verify Payment Endpoint ---
-app.get('/api/payments/verify/:reference', async (req, res) => {
+app.get('/api/payments/verify/:reference', checkFirebase, async (req, res) => {
   try {
     const { reference } = req.params;
-    const config = {
-      headers: {
-        Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-      }
-    };
+    const config = { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } };
     const paystackResponse = await axios.get(`${PAYSTACK_VERIFY_URL}${reference}`, config);
     res.status(200).send({ status: paystackResponse.data.data.status });
   } catch (error) {
@@ -81,8 +163,31 @@ app.get('/api/payments/verify/:reference', async (req, res) => {
   }
 });
 
-
-app.post('/api/bookings', async (req, res) => { /* ... your existing bookings endpoint ... */ });
+app.post('/api/bookings', checkFirebase, async (req, res) => {
+  try {
+    const { userId, serviceId, startTime } = req.body;
+    if (!userId || !serviceId || !startTime) {
+      return res.status(400).send({ error: 'Missing required booking information.' });
+    }
+    const newBooking = { userId, serviceId, startTime: new Date(startTime), status: 'paid', createdAt: new Date() };
+    const docRef = await db.collection('bookings').add(newBooking);
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+    if (userDoc.exists) {
+      const currentPoints = userDoc.data().loyaltyPoints || 0;
+      const newPoints = currentPoints + 1;
+      if (newPoints >= 10) {
+        await userRef.update({ loyaltyPoints: 0, freeWashes: admin.firestore.FieldValue.increment(1) });
+      } else {
+        await userRef.update({ loyaltyPoints: newPoints });
+      }
+    }
+    res.status(201).send({ message: 'Booking created successfully!', bookingId: docRef.id });
+  } catch (error) {
+    console.error('Error creating booking:', error);
+    res.status(500).send({ error: 'Failed to create booking.' });
+  }
+});
 
 // ----- Start Server -----
 app.listen(PORT, '0.0.0.0', () => {
