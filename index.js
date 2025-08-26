@@ -48,6 +48,7 @@ app.post('/auth/signup', async (req, res) => {
       name: userRecord.displayName,
       loyaltyPoints: 0,
       freeWashes: 0,
+      role: 'customer', // Default role for all new users
     };
     await db.collection('users').doc(userRecord.uid).set(userProfile);
     res.status(201).send({ uid: userRecord.uid });
@@ -55,6 +56,27 @@ app.post('/auth/signup', async (req, res) => {
     res.status(400).send({ error: error.message });
   }
 });
+
+// --- NEW: Endpoint to assign a manager role ---
+app.post('/api/assign-manager-role', async (req, res) => {
+    const { email } = req.body;
+    if (!email) {
+        return res.status(400).send({ error: 'Email is required.' });
+    }
+    try {
+        const user = await admin.auth().getUserByEmail(email);
+        // Set a custom claim on the user's authentication token
+        await admin.auth().setCustomUserClaims(user.uid, { role: 'manager' });
+        // Also update their profile in the database
+        await db.collection('users').doc(user.uid).update({ role: 'manager' });
+        
+        res.status(200).send({ message: `Successfully assigned manager role to ${email}` });
+    } catch (error) {
+        console.error("Error assigning manager role:", error);
+        res.status(500).send({ error: 'Could not assign manager role.' });
+    }
+});
+
 
 app.get('/api/services', async (req, res) => {
   try {
@@ -171,10 +193,6 @@ app.post('/api/bookings', async (req, res) => {
       return res.status(400).send({ error: 'Missing required booking information.' });
     }
     
-    // --- THIS IS THE FIX ---
-    // The incoming startTime is a local SAST time string (e.g., "2025-08-26T08:00:00")
-    // We create a Date object from it, which the server interprets as UTC.
-    // We then subtract 2 hours (120 minutes) to get the correct UTC timestamp for storage.
     const localTime = new Date(startTime);
     const correctUTCTime = addMinutes(localTime, -120);
 
@@ -187,7 +205,7 @@ app.post('/api/bookings', async (req, res) => {
     const newBooking = {
       userId,
       serviceId,
-      startTime: correctUTCTime, // Save the corrected UTC time
+      startTime: correctUTCTime,
       status: 'paid',
       createdAt: new Date(),
       bayId: (existingBookings.size + 1)
