@@ -170,17 +170,24 @@ app.post('/api/bookings', async (req, res) => {
     if (!userId || !serviceId || !startTime) {
       return res.status(400).send({ error: 'Missing required booking information.' });
     }
-    const requestedStartTime = new Date(startTime);
+    
+    // --- THIS IS THE FIX ---
+    // The incoming startTime is a local SAST time string (e.g., "2025-08-26T08:00:00")
+    // We create a Date object from it, which the server interprets as UTC.
+    // We then subtract 2 hours (120 minutes) to get the correct UTC timestamp for storage.
+    const localTime = new Date(startTime);
+    const correctUTCTime = addMinutes(localTime, -120);
+
     const settingsDoc = await db.collection('settings').doc('washSettings').get();
     const activeBays = settingsDoc.exists ? settingsDoc.data().activeBays : 1;
-    const existingBookings = await db.collection('bookings').where('startTime', '==', requestedStartTime).get();
+    const existingBookings = await db.collection('bookings').where('startTime', '==', correctUTCTime).get();
     if (existingBookings.size >= activeBays) {
       return res.status(409).send({ error: 'Sorry, this time slot was just taken. Please select another time.' });
     }
     const newBooking = {
       userId,
       serviceId,
-      startTime: requestedStartTime,
+      startTime: correctUTCTime, // Save the corrected UTC time
       status: 'paid',
       createdAt: new Date(),
       bayId: (existingBookings.size + 1)
