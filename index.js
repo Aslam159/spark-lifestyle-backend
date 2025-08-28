@@ -32,12 +32,20 @@ const PAYSTACK_API_URL = 'https://api.paystack.co/transaction/initialize';
 const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify/';
 
 // --- SECURITY: Rate Limiter ---
-// Apply to all API routes to prevent abuse
+// General limiter for most API routes
 const apiLimiter = rateLimit({
 	windowMs: 15 * 60 * 1000, // 15 minutes
 	max: 100, // Limit each IP to 100 requests per window
 	standardHeaders: true,
 	legacyHeaders: false,
+});
+// Stricter limiter for account creation
+const createAccountLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 5, // Limit each IP to 5 create account requests per windowMs
+    message: 'Too many accounts created from this IP, please try again after an hour',
+    standardHeaders: true,
+    legacyHeaders: false,
 });
 app.use('/api/', apiLimiter);
 
@@ -66,7 +74,8 @@ const isManager = async (req, res, next) => {
 
 app.get('/', (req, res) => res.send('Welcome API!'));
 
-app.post('/auth/signup', async (req, res) => {
+// --- UPDATED: Apply the stricter rate limiter to the signup route ---
+app.post('/auth/signup', createAccountLimiter, async (req, res) => {
   try {
     const { email, password, name } = req.body;
     const userRecord = await admin.auth().createUser({ email, password, displayName: name });
@@ -367,3 +376,4 @@ app.post('/api/manager/blocked-slots', isManager, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
+
