@@ -5,6 +5,7 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const { format, startOfDay, endOfDay, addMinutes, isSameDay, isBefore, startOfToday, startOfMonth, endOfMonth } = require('date-fns');
 const axios = require('axios');
+const rateLimit = require('express-rate-limit'); // Import rate-limiting package
 
 // ----- Firebase Configuration -----
 try {
@@ -29,6 +30,17 @@ const PORT = process.env.PORT || 3001;
 const PAYSTACK_SECRET_KEY = 'sk_test_c75e440a7b40c66a47a8ab73605ec0ac3cdbaece';
 const PAYSTACK_API_URL = 'https://api.paystack.co/transaction/initialize';
 const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify/';
+
+// --- SECURITY: Rate Limiter ---
+// Apply to all API routes to prevent abuse
+const apiLimiter = rateLimit({
+	windowMs: 15 * 60 * 1000, // 15 minutes
+	max: 100, // Limit each IP to 100 requests per window
+	standardHeaders: true,
+	legacyHeaders: false,
+});
+app.use('/api/', apiLimiter);
+
 
 // --- Middleware to verify user is a manager ---
 const isManager = async (req, res, next) => {
@@ -66,7 +78,7 @@ app.post('/auth/signup', async (req, res) => {
   }
 });
 
-app.post('/api/assign-manager-role', async (req, res) => {
+app.post('/api/assign-manager-role', isManager, async (req, res) => { // Protected endpoint
     const { email } = req.body;
     if (!email) { return res.status(400).send({ error: 'Email is required.' }); }
     try {
@@ -164,9 +176,17 @@ app.post('/api/payments/checkout', async (req, res) => {
   }
 });
 
+// --- UPDATED: SSRF Security Fix ---
 app.get('/api/payments/verify/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
+
+    // Sanitize the input to prevent SSRF attacks
+    const validReferenceRegex = /^[a-zA-Z0-9_]+$/;
+    if (!validReferenceRegex.test(reference)) {
+        return res.status(400).send({ error: 'Invalid transaction reference format.' });
+    }
+
     const config = { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } };
     const paystackResponse = await axios.get(`${PAYSTACK_VERIFY_URL}${reference}`, config);
     res.status(200).send({ status: paystackResponse.data.data.status });
@@ -178,14 +198,9 @@ app.get('/api/payments/verify/:reference', async (req, res) => {
 app.post('/api/bookings', async (req, res) => {
   try {
     const { userId, serviceId, startTime } = req.body;
-    if (!userId || !serviceId || !startTime) {
-      return res.status(400).send({ error: 'Missing required booking information.' });
-    }
-    
     const correctUTCTime = addMinutes(new Date(startTime), -120);
     const dateKey = format(correctUTCTime, 'yyyy-MM-dd');
 
-    // --- UPDATED RACE CONDITION CHECK ---
     const dailySettingDoc = await db.collection('dailySettings').doc(dateKey).get();
     let activeBays;
     if (dailySettingDoc.exists) {
@@ -203,11 +218,9 @@ app.post('/api/bookings', async (req, res) => {
     const newBooking = { userId, serviceId, startTime: correctUTCTime, status: 'paid', createdAt: new Date(), bayId: (existingBookings.size + 1) };
     const docRef = await db.collection('bookings').add(newBooking);
 
-    // --- UPDATED LOYALTY POINTS LOGIC ---
     const userRef = db.collection('users').doc(userId);
     let userDoc = await userRef.get();
 
-    // If user profile doesn't exist, create it for them
     if (!userDoc.exists) {
         const authUser = await admin.auth().getUser(userId);
         const newUserProfile = {
@@ -218,7 +231,7 @@ app.post('/api/bookings', async (req, res) => {
             role: 'customer'
         };
         await userRef.set(newUserProfile);
-        userDoc = await userRef.get(); // Re-fetch the new document
+        userDoc = await userRef.get();
     }
 
     const currentPoints = userDoc.data().loyaltyPoints || 0;
@@ -354,6 +367,3 @@ app.post('/api/manager/blocked-slots', isManager, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
-
-
-
