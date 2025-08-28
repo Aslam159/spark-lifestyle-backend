@@ -95,6 +95,7 @@ app.get('/api/availability', async (req, res) => {
   try {
     const requestedDate = new Date(`${date}T00:00:00.000Z`);
     if (isBefore(requestedDate, startOfToday())) { return res.status(200).send([]); }
+    
     const dailySettingDoc = await db.collection('dailySettings').doc(date).get();
     let activeBays;
     if (dailySettingDoc.exists) {
@@ -103,9 +104,11 @@ app.get('/api/availability', async (req, res) => {
         const globalSettingsDoc = await db.collection('settings').doc('washSettings').get();
         activeBays = globalSettingsDoc.exists ? globalSettingsDoc.data().activeBays : 1;
     }
+
     const startOfRequestedDay = startOfDay(requestedDate);
     const endOfRequestedDay = endOfDay(requestedDate);
     const openingHourUTC = 6, closingHourUTC = 14, slotInterval = 15;
+    
     const allSlots = [];
     let currentTime = new Date(startOfRequestedDay);
     currentTime.setUTCHours(openingHourUTC, 0, 0, 0);
@@ -115,6 +118,7 @@ app.get('/api/availability', async (req, res) => {
       allSlots.push(format(addMinutes(currentTime, 120), 'HH:mm'));
       currentTime = addMinutes(currentTime, slotInterval);
     }
+
     const bookingsSnapshot = await db.collection('bookings').where('startTime', '>=', startOfRequestedDay).where('startTime', '<=', endOfRequestedDay).get();
     const occupiedSlotCounts = {};
     for (const doc of bookingsSnapshot.docs) {
@@ -129,11 +133,14 @@ app.get('/api/availability', async (req, res) => {
         slotTime = addMinutes(slotTime, slotInterval);
       }
     }
+
     const blockedSlotsSnapshot = await db.collection('blockedSlots').where('date', '==', date).get();
     const blockedSlots = new Set(blockedSlotsSnapshot.docs.map(doc => doc.data().slot));
+
     let availableSlots = allSlots.filter(slot => 
         ((occupiedSlotCounts[slot] || 0) < activeBays) && !blockedSlots.has(slot)
     );
+
     if (isSameDay(requestedDate, new Date())) {
       const currentTimeSAST = format(addMinutes(new Date(), 120), 'HH:mm');
       availableSlots = availableSlots.filter(slot => slot > currentTimeSAST);
@@ -171,27 +178,46 @@ app.get('/api/payments/verify/:reference', async (req, res) => {
 app.post('/api/bookings', async (req, res) => {
   try {
     const { userId, serviceId, startTime } = req.body;
+    console.log(`[Booking] Received request from user ${userId} for slot ${startTime}`);
+
+    if (!userId || !serviceId || !startTime) {
+      return res.status(400).send({ error: 'Missing required booking information.' });
+    }
+    
     const correctUTCTime = addMinutes(new Date(startTime), -120);
+    console.log(`[Booking] Converted to UTC: ${correctUTCTime.toISOString()}`);
+
     const settingsDoc = await db.collection('settings').doc('washSettings').get();
     const activeBays = settingsDoc.exists ? settingsDoc.data().activeBays : 1;
+    console.log(`[Booking] Checking against ${activeBays} active bays.`);
+
     const existingBookings = await db.collection('bookings').where('startTime', '==', correctUTCTime).get();
+    console.log(`[Booking] Found ${existingBookings.size} existing bookings for this exact slot.`);
+
     if (existingBookings.size >= activeBays) {
+      console.log(`[Booking] CONFLICT: Slot is full. Rejecting booking.`);
       return res.status(409).send({ error: 'Sorry, this time slot was just taken. Please select another time.' });
     }
+
     const newBooking = { userId, serviceId, startTime: correctUTCTime, status: 'paid', createdAt: new Date(), bayId: (existingBookings.size + 1) };
     const docRef = await db.collection('bookings').add(newBooking);
+    console.log(`[Booking] Successfully created booking with ID: ${docRef.id}`);
+
     const userRef = db.collection('users').doc(userId);
     const userDoc = await userRef.get();
     if (userDoc.exists) {
       const newPoints = (userDoc.data().loyaltyPoints || 0) + 1;
       if (newPoints >= 10) {
         await userRef.update({ loyaltyPoints: 0, freeWashes: admin.firestore.FieldValue.increment(1) });
+        console.log(`[Booking] User ${userId} earned a free wash.`);
       } else {
         await userRef.update({ loyaltyPoints: newPoints });
+        console.log(`[Booking] User ${userId} now has ${newPoints} points.`);
       }
     }
     res.status(201).send({ message: 'Booking created successfully!', bookingId: docRef.id });
   } catch (error) {
+    console.error('[Booking] CRITICAL ERROR creating booking:', error);
     res.status(500).send({ error: 'Failed to create booking.' });
   }
 });
@@ -314,7 +340,6 @@ app.post('/api/manager/blocked-slots', isManager, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
-
 
 
 
