@@ -178,43 +178,57 @@ app.get('/api/payments/verify/:reference', async (req, res) => {
 app.post('/api/bookings', async (req, res) => {
   try {
     const { userId, serviceId, startTime } = req.body;
-    console.log(`[Booking] Received request from user ${userId} for slot ${startTime}`);
-
     if (!userId || !serviceId || !startTime) {
       return res.status(400).send({ error: 'Missing required booking information.' });
     }
     
     const correctUTCTime = addMinutes(new Date(startTime), -120);
-    console.log(`[Booking] Converted to UTC: ${correctUTCTime.toISOString()}`);
+    const dateKey = format(correctUTCTime, 'yyyy-MM-dd');
 
-    const settingsDoc = await db.collection('settings').doc('washSettings').get();
-    const activeBays = settingsDoc.exists ? settingsDoc.data().activeBays : 1;
-    console.log(`[Booking] Checking against ${activeBays} active bays.`);
-
+    // --- UPDATED RACE CONDITION CHECK ---
+    const dailySettingDoc = await db.collection('dailySettings').doc(dateKey).get();
+    let activeBays;
+    if (dailySettingDoc.exists) {
+        activeBays = dailySettingDoc.data().activeBays;
+    } else {
+        const globalSettingsDoc = await db.collection('settings').doc('washSettings').get();
+        activeBays = globalSettingsDoc.exists ? globalSettingsDoc.data().activeBays : 1;
+    }
+    
     const existingBookings = await db.collection('bookings').where('startTime', '==', correctUTCTime).get();
-    console.log(`[Booking] Found ${existingBookings.size} existing bookings for this exact slot.`);
-
     if (existingBookings.size >= activeBays) {
-      console.log(`[Booking] CONFLICT: Slot is full. Rejecting booking.`);
       return res.status(409).send({ error: 'Sorry, this time slot was just taken. Please select another time.' });
     }
 
     const newBooking = { userId, serviceId, startTime: correctUTCTime, status: 'paid', createdAt: new Date(), bayId: (existingBookings.size + 1) };
     const docRef = await db.collection('bookings').add(newBooking);
-    console.log(`[Booking] Successfully created booking with ID: ${docRef.id}`);
 
+    // --- UPDATED LOYALTY POINTS LOGIC ---
     const userRef = db.collection('users').doc(userId);
-    const userDoc = await userRef.get();
-    if (userDoc.exists) {
-      const newPoints = (userDoc.data().loyaltyPoints || 0) + 1;
-      if (newPoints >= 10) {
-        await userRef.update({ loyaltyPoints: 0, freeWashes: admin.firestore.FieldValue.increment(1) });
-        console.log(`[Booking] User ${userId} earned a free wash.`);
-      } else {
-        await userRef.update({ loyaltyPoints: newPoints });
-        console.log(`[Booking] User ${userId} now has ${newPoints} points.`);
-      }
+    let userDoc = await userRef.get();
+
+    // If user profile doesn't exist, create it for them
+    if (!userDoc.exists) {
+        const authUser = await admin.auth().getUser(userId);
+        const newUserProfile = {
+            email: authUser.email,
+            name: authUser.displayName,
+            loyaltyPoints: 0,
+            freeWashes: 0,
+            role: 'customer'
+        };
+        await userRef.set(newUserProfile);
+        userDoc = await userRef.get(); // Re-fetch the new document
     }
+
+    const currentPoints = userDoc.data().loyaltyPoints || 0;
+    const newPoints = currentPoints + 1;
+    if (newPoints >= 10) {
+      await userRef.update({ loyaltyPoints: 0, freeWashes: admin.firestore.FieldValue.increment(1) });
+    } else {
+      await userRef.update({ loyaltyPoints: newPoints });
+    }
+    
     res.status(201).send({ message: 'Booking created successfully!', bookingId: docRef.id });
   } catch (error) {
     console.error('[Booking] CRITICAL ERROR creating booking:', error);
