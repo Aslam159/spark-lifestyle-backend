@@ -1,5 +1,4 @@
 // index.js
-// index.js
 // ----- Imports -----
 const express = require('express');
 const cors = require('cors');
@@ -212,6 +211,11 @@ app.post('/api/bookings', async (req, res) => {
             return res.status(400).send({ error: 'Missing required booking information.' });
         }
         
+        // SECURITY FIX: Prevent Prototype Pollution
+        if (locationId === '__proto__' || locationId === 'constructor' || locationId === 'prototype') {
+            return res.status(400).send({ error: 'Invalid locationId.' });
+        }
+        
         const correctUTCTime = subHours(new Date(startTime), 2);
         const dateKey = format(correctUTCTime, 'yyyy-MM-dd');
         
@@ -259,6 +263,12 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
     if (!userId || !serviceId || !startTime || !locationId) {
         return res.status(400).send({ error: 'Missing required booking information.' });
     }
+
+    // SECURITY FIX: Prevent Prototype Pollution
+    if (locationId === '__proto__' || locationId === 'constructor' || locationId === 'prototype') {
+        return res.status(400).send({ error: 'Invalid locationId.' });
+    }
+    
     // Logic to check if the service is eligible for a free wash could go here
     const userRef = db.collection('users').doc(userId);
     const userDoc = await userRef.get();
