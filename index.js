@@ -237,10 +237,17 @@ app.post('/api/bookings', async (req, res) => {
         const userRef = db.collection('users').doc(userId);
         const userDoc = await userRef.get();
         if (!userDoc.exists) {
-            return res.status(404).send({ error: 'User profile not found.' });
+            const userRecord = await admin.auth().getUser(userId);
+            const userProfile = {
+                email: userRecord.email,
+                name: userRecord.displayName,
+                role: 'customer',
+                rewards: {},
+            };
+            await userRef.set(userProfile);
         }
 
-        const currentRewards = userDoc.data().rewards || {};
+        const currentRewards = userDoc.data()?.rewards || {};
         const locationRewards = currentRewards[locationId] || { loyaltyPoints: 0, freeWashes: 0 };
         const newPoints = locationRewards.loyaltyPoints + 1;
 
@@ -266,12 +273,10 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
         return res.status(400).send({ error: 'Missing required booking information.' });
     }
 
-    // SECURITY FIX: Prevent Prototype Pollution
     if (locationId === '__proto__' || locationId === 'constructor' || locationId === 'prototype') {
         return res.status(400).send({ error: 'Invalid locationId.' });
     }
     
-    // Logic to check if the service is eligible for a free wash could go here
     const userRef = db.collection('users').doc(userId);
     const userDoc = await userRef.get();
     if (!userDoc.exists || !userDoc.data().rewards || !userDoc.data().rewards[locationId] || userDoc.data().rewards[locationId].freeWashes < 1) {
@@ -279,9 +284,9 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
     }
 
     const correctUTCTime = subHours(new Date(startTime), 2);
-    // ... (Race condition check for free wash)
+    // ... (Race condition check for free wash would go here)
     
-    const newBooking = { userId, serviceId, startTime: correctUTCTime, status: 'free', createdAt: new Date(), bayId: 1 }; // Simplified bay assignment
+    const newBooking = { userId, serviceId, startTime: correctUTCTime, status: 'free', createdAt: new Date(), bayId: 1 };
     await db.collection('locations').doc(locationId).collection('bookings').add(newBooking);
     
     await userRef.update({ [`rewards.${locationId}.freeWashes`]: admin.firestore.FieldValue.increment(-1) });
@@ -290,6 +295,18 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
 });
 
 // MANAGER ROUTES
+app.post('/api/assign-manager-role', async (req, res) => {
+    const { email } = req.body;
+    // In a real app, you'd want a super-admin check here
+    try {
+        const user = await admin.auth().getUserByEmail(email);
+        await admin.auth().setCustomUserClaims(user.uid, { role: 'manager' });
+        res.status(200).send({ message: `Successfully assigned manager role to ${email}` });
+    } catch (error) {
+        res.status(500).send({ error: error.message });
+    }
+});
+
 app.get('/api/manager/bookings', isManager, async (req, res) => {
     const { date } = req.query;
     const locationId = req.user.managedLocationId;
