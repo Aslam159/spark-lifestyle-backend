@@ -1,4 +1,5 @@
 // index.js
+// index.js
 // ----- Imports -----
 const express = require('express');
 const cors = require('cors');
@@ -110,7 +111,8 @@ app.get('/api/services', async (req, res) => {
     const { locationId } = req.query;
     if (!locationId) { return res.status(400).send({ error: 'Location ID is required.' }); }
     try {
-        const servicesSnapshot = await db.collection('locations').doc(locationId).collection('services').where('isActive', '==', true).get();
+        // UPDATED: Sort services by the 'displayOrder' field
+        const servicesSnapshot = await db.collection('locations').doc(locationId).collection('services').where('isActive', '==', true).orderBy('displayOrder').get();
         const servicesList = servicesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         res.status(200).send(servicesList);
     } catch (error) {
