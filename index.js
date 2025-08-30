@@ -179,13 +179,30 @@ app.get('/api/availability', async (req, res) => {
   }
 
   try {
-    const requestedDate = new Date(`${date}T00:00:00.000Z`);
-    if (isNaN(requestedDate.getTime())) {
-      return res.status(400).json({ error: 'Invalid date format (expected yyyy-MM-dd).' });
+    // --- Work in SAST consistently (SA has no DST) ---
+    const addMinutes = (d, mins) => new Date(d.getTime() + mins * 60000);
+    const pad = (n) => String(n).padStart(2, '0');
+
+    // "Now" in SAST
+    const nowSAST = addMinutes(new Date(), 120);
+    const todayKeySAST = `${nowSAST.getFullYear()}-${pad(nowSAST.getMonth() + 1)}-${pad(nowSAST.getDate())}`;
+
+    // Quick past-day check using yyyy-MM-dd string compare (safe lexicographically)
+    if (date < todayKeySAST) {
+      return res.status(200).json([]);
     }
 
-    if (isBefore(requestedDate, startOfToday())) {
-      return res.status(200).json([]);
+    // Slot window in **SAST**
+    const openingHourSAST = 8;   // 08:00
+    const closingHourSAST = 16;  // 16:00 (exclusive)
+    const slotInterval = 15;     // minutes
+
+    // Build all slots as SAST "HH:mm" strings
+    const allSlots = [];
+    for (let minutes = openingHourSAST * 60; minutes < closingHourSAST * 60; minutes += slotInterval) {
+      const h = Math.floor(minutes / 60);
+      const m = minutes % 60;
+      allSlots.push(`${pad(h)}:${pad(m)}`);
     }
 
     // Settings (daily -> global -> default 2)
@@ -195,47 +212,36 @@ app.get('/api/availability', async (req, res) => {
       settingsRef.doc('global').get(),
     ]);
 
-    const activeBays =
+    let activeBays =
       (dailySettingDoc.exists && dailySettingDoc.data()?.activeBays) ??
       (globalSettingsDoc.exists && globalSettingsDoc.data()?.activeBays) ??
       2;
 
-    // Build slots (UTC day, display SAST via +120 min)
-    const openingHourUTC = 6;
-    const closingHourUTC = 14;
-    const slotInterval = 15;
+    // Clamp to sane minimum to avoid "all blocked" surprises
+    if (!Number.isFinite(activeBays) || activeBays <= 0) activeBays = 1;
 
-    const startOfRequestedDay = startOfDay(requestedDate);
-    const endOfRequestedDay = endOfDay(requestedDate);
+    // --- Bookings window in UTC that corresponds to the SAST date ---
+    // SAST day runs from 00:00 SAST to 23:59:59.999 SAST.
+    // In UTC that's SAST-2 hours.
+    const startUTC = new Date(`${date}T00:00:00.000Z`);                // 00:00 UTC (which is 02:00 SAST)
+    const startOfDayUTCForSAST = new Date(startUTC.getTime() - 120 * 60000); // 22:00 previous day UTC = 00:00 SAST
+    const endOfDayUTCForSAST   = new Date(startOfDayUTCForSAST.getTime() + (24 * 60 * 60000) - 1);
 
-    const allSlots = [];
-    let currentTime = new Date(startOfRequestedDay);
-    currentTime.setUTCHours(openingHourUTC, 0, 0, 0);
-    const closingDateTime = new Date(startOfRequestedDay);
-    closingDateTime.setUTCHours(closingHourUTC, 0, 0, 0);
-
-    while (currentTime < closingDateTime) {
-      allSlots.push(format(addMinutes(currentTime, 120), 'HH:mm'));
-      currentTime = addMinutes(currentTime, slotInterval);
-    }
-
-    // Fetch bookings (range + orderBy)
+    // Fetch bookings within the SAST day window
     const bookingsRef = db.collection('locations').doc(locationId).collection('bookings');
     const bookingsSnapshot = await bookingsRef
-      .where('startTime', '>=', startOfRequestedDay)
-      .where('startTime', '<=', endOfRequestedDay)
+      .where('startTime', '>=', startOfDayUTCForSAST)
+      .where('startTime', '<=', endOfDayUTCForSAST)
       .orderBy('startTime', 'asc')
       .get();
 
-    const occupiedSlotCounts = {};
+    // Preload service durations (avoid N+1)
     const serviceIds = new Set();
-
     for (const d of bookingsSnapshot.docs) {
       const b = d.data() || {};
       if (b?.serviceId) serviceIds.add(String(b.serviceId));
     }
 
-    // Cache service durations
     const serviceDurations = {};
     await Promise.all(
       Array.from(serviceIds).map(async (sid) => {
@@ -247,7 +253,8 @@ app.get('/api/availability', async (req, res) => {
             .doc(sid)
             .get();
           if (sd.exists) {
-            serviceDurations[sid] = Number(sd.data()?.durationInMinutes) || 15;
+            const dur = Number(sd.data()?.durationInMinutes);
+            serviceDurations[sid] = Number.isFinite(dur) && dur > 0 ? dur : 15;
           }
         } catch (e) {
           console.warn('[availability] failed to read service', sid, e);
@@ -255,7 +262,8 @@ app.get('/api/availability', async (req, res) => {
       })
     );
 
-    // Mark occupied slots
+    // Tally occupied slots (convert booking startTime UTC -> SAST slot strings)
+    const occupiedSlotCounts = {};
     for (const d of bookingsSnapshot.docs) {
       try {
         const b = d.data() || {};
@@ -265,87 +273,56 @@ app.get('/api/availability', async (req, res) => {
           console.warn('[availability] skipping bad booking', d.id, { hasStartTime: !!ts, sid });
           continue;
         }
-
+        const startUTCDate = ts.toDate();
+        const startSAST = addMinutes(startUTCDate, 120);
         const duration = serviceDurations[sid] ?? 15;
-        let slotTime = ts.toDate();
-        const nSlots = Math.max(1, Math.ceil(duration / slotInterval));
-        for (let i = 0; i < nSlots; i++) {
-          const formattedSlot = format(addMinutes(slotTime, 120), 'HH:mm');
-          occupiedSlotCounts[formattedSlot] = (occupiedSlotCounts[formattedSlot] || 0) + 1;
-          slotTime = addMinutes(slotTime, slotInterval);
+
+        let minutes = startSAST.getHours() * 60 + startSAST.getMinutes();
+        const steps = Math.max(1, Math.ceil(duration / slotInterval));
+        for (let i = 0; i < steps; i++) {
+          const h = Math.floor(minutes / 60);
+          const m = minutes % 60;
+          const slot = `${pad(h)}:${pad(m)}`;
+          occupiedSlotCounts[slot] = (occupiedSlotCounts[slot] || 0) + 1;
+          minutes += slotInterval;
         }
       } catch (e) {
         console.warn('[availability] failed to process booking', d.id, e);
       }
     }
 
-    // Blocked slots
-    const blockedSlotsSnapshot = await db
+    // Blocked slots for this SAST date
+    const blockedSnap = await db
       .collection('locations')
       .doc(locationId)
       .collection('blockedSlots')
       .where('date', '==', date)
       .get();
-    const blockedSlots = new Set(
-      blockedSlotsSnapshot.docs.map((doc) => doc.data()?.slot).filter(Boolean)
-    );
+    const blocked = new Set(blockedSnap.docs.map((doc) => doc.data()?.slot).filter(Boolean));
 
-    // Available slots = not full & not blocked
+    // Compute candidates
     let availableSlots = allSlots.filter(
-      (s) => ((occupiedSlotCounts[s] || 0) < activeBays) && !blockedSlots.has(s)
+      (s) => ((occupiedSlotCounts[s] || 0) < activeBays) && !blocked.has(s)
     );
 
-    // Remove past times if querying today (compare in SAST)
-    if (isSameDay(requestedDate, new Date())) {
-      const nowSAST = format(addMinutes(new Date(), 120), 'HH:mm');
-      availableSlots = availableSlots.filter((s) => s > nowSAST);
+    // If querying "today" (in SAST), remove past times
+    if (date === todayKeySAST) {
+      const nowHHmm = `${pad(nowSAST.getHours())}:${pad(nowSAST.getMinutes())}`;
+      availableSlots = availableSlots.filter((s) => s > nowHHmm);
     }
+
+    console.log('[availability] result', {
+      date,
+      locationId,
+      activeBays,
+      totalSlots: allSlots.length,
+      freeSlots: availableSlots.length,
+    });
 
     return res.status(200).json(availableSlots);
   } catch (error) {
     console.error('Error in /api/availability:', error);
-    // Always JSON so clients never see "Network Error"
     return res.status(500).json({ error: 'Failed to fetch availability.' });
-  }
-});
-
-// ----- Payments -----
-app.post('/api/payments/checkout', async (req, res) => {
-  try {
-    const { amount, email } = req.body || {};
-    if (typeof amount !== 'number' || !email) {
-      return res.status(400).json({ error: 'Invalid payment payload.' });
-    }
-    const amountInCents = Math.round(amount * 100);
-    const data = { email, amount: amountInCents, currency: 'ZAR' };
-    const config = {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' },
-      timeout: 20000,
-    };
-    const paystackResponse = await axios.post(PAYSTACK_API_URL, data, config);
-    res.status(200).json({
-      authorization_url: paystackResponse.data.data.authorization_url,
-      reference: paystackResponse.data.data.reference,
-    });
-  } catch (error) {
-    console.error('Error in /api/payments/checkout:', error?.response?.data || error?.message || error);
-    res.status(500).json({ error: 'Failed to initialize payment.' });
-  }
-});
-
-app.get('/api/payments/verify/:reference', async (req, res) => {
-  try {
-    const { reference } = req.params || {};
-    const validReferenceRegex = /^[a-zA-Z0-9_]+$/;
-    if (!validReferenceRegex.test(reference)) {
-      return res.status(400).json({ error: 'Invalid transaction reference format.' });
-    }
-    const config = { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }, timeout: 20000 };
-    const paystackResponse = await axios.get(`${PAYSTACK_VERIFY_URL}${reference}`, config);
-    res.status(200).json({ status: paystackResponse.data.data.status });
-  } catch (error) {
-    console.error('Error in /api/payments/verify:', error?.response?.data || error?.message || error);
-    res.status(500).json({ error: 'Failed to verify payment.' });
   }
 });
 
