@@ -18,27 +18,42 @@ const {
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 
-// ---------- Time helpers (SAST-aware) ----------
+// ---------- Time helpers (SAST-aware, robust) ----------
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+// Accept {date:'yyyy-MM-dd', slot:'HH:mm'} OR {startTime:'ISO or yyyy-MM-ddTHH:mm'}.
+// Always return a Date that represents the UTC instant of the SAST time chosen.
+// Also normalizes seconds/millis to 00:000 for Firestore equality queries.
 function parseStartUTCFromBody(body) {
-  // Accept either { date:'yyyy-MM-dd', slot:'HH:mm' } OR { startTime: ISOish string }
   if (body?.date && body?.slot) {
-    // Interpret as SAST and convert to UTC
-    // Example: '2025-08-30' + '09:15' => '2025-08-30T09:15:00+02:00' (SAST)
-    return new Date(`${body.date}T${body.slot}:00+02:00`);
+    // Normalize slot to HH:mm
+    const parts = String(body.slot).split(':').map((x) => parseInt(x, 10));
+    if (!Number.isFinite(parts[0])) return null;
+    const hh = pad2(parts[0]);
+    const mm = pad2(Number.isFinite(parts[1]) ? parts[1] : 0);
+    const d = new Date(`${body.date}T${hh}:${mm}:00+02:00`); // SAST -> UTC
+    d.setSeconds(0, 0);
+    return d;
   }
   if (body?.startTime) {
-    const st = String(body.startTime).replace(' ', 'T');
-    // If already has Z or an offset, trust it; else treat as SAST
-    if (/[zZ]|[+\-]\d\d:\d\d$/.test(st)) return new Date(st);
-    return new Date(`${st}+02:00`);
+    // Allow either ISO with Z/offset, or local-ish "yyyy-MM-ddTHH:mm"
+    let st = String(body.startTime).replace(' ', 'T');
+    if (!/[zZ]|[+\-]\d\d:\d\d$/.test(st)) {
+      // No zone provided: treat as SAST
+      st = `${st}:00+02:00`;
+    }
+    const d = new Date(st);
+    d.setSeconds(0, 0);
+    return d;
   }
   return null;
 }
 
+// Clamp bays so a mistaken 0 doesn't block everything
 function clampActiveBays(val, fallback = 2) {
   const n = Number(val);
-  if (!Number.isFinite(n)) return Math.max(1, fallback);
-  return Math.max(1, n); // never 0
+  if (!Number.isFinite(n) || n < 1) return Math.max(1, fallback);
+  return n;
 }
 
 // ----- Firebase Configuration -----
@@ -354,25 +369,19 @@ app.post('/api/bookings/verify-slot', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Database not initialized.' });
 
   try {
-    const { locationId } = req.body || {};
+    const locationId = req.body?.locationId || req.query?.locationId;
     const startUTC = parseStartUTCFromBody(req.body);
 
     if (!locationId || !startUTC) {
-      return res.status(400).json({ error: 'Missing or invalid locationId / start time.' });
+      return res.status(400).json({ error: 'Missing or invalid locationId / start time (use {date,slot,locationId} or {startTime,locationId}).' });
     }
     if (['__proto__', 'constructor', 'prototype'].includes(String(locationId))) {
       return res.status(400).json({ error: 'Invalid locationId.' });
     }
 
-    // Normalize to minute precision so Firestore equality matches exactly
-    startUTC.setSeconds(0, 0);
-
-    // Figure out the SAST date key for settings (yyyy-MM-dd)
+    // Derive SAST date key for settings
     const startSAST = new Date(startUTC.getTime() + 120 * 60000);
-    const y = startSAST.getFullYear();
-    const m = String(startSAST.getMonth() + 1).padStart(2, '0');
-    const d = String(startSAST.getDate()).padStart(2, '0');
-    const dateKey = `${y}-${m}-${d}`;
+    const dateKey = `${startSAST.getFullYear()}-${pad2(startSAST.getMonth() + 1)}-${pad2(startSAST.getDate())}`;
 
     const settingsRef = db.collection('locations').doc(locationId).collection('settings');
     const [daily, global] = await Promise.all([
@@ -380,29 +389,34 @@ app.post('/api/bookings/verify-slot', async (req, res) => {
       settingsRef.doc('global').get(),
     ]);
 
-    // IMPORTANT: clamp to >=1 so "0" never blocks every slot
     const activeBays = clampActiveBays(
       (daily.exists && daily.data()?.activeBays) ??
       (global.exists && global.data()?.activeBays) ??
       2
     );
 
-    // Count bookings that start at exactly the same start time
-    const existingBookings = await db
+    const existing = await db
       .collection('locations').doc(locationId).collection('bookings')
       .where('startTime', '==', startUTC)
       .get();
 
-    if (existingBookings.size >= activeBays) {
+    console.log('[verify-slot]', {
+      locationId, dateKey,
+      startUTC: startUTC.toISOString(),
+      activeBays, existing: existing.size
+    });
+
+    if (existing.size >= activeBays) {
       return res.status(409).json({ error: 'Slot is no longer available.' });
     }
 
-    return res.status(200).json({ message: 'Slot is available.' });
+    return res.status(200).json({ ok: true, message: 'Slot is available.' });
   } catch (error) {
     console.error('Error in /api/bookings/verify-slot:', error);
     return res.status(500).json({ error: 'Failed to verify slot availability.' });
   }
 });
+
 
 app.post('/api/bookings', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Database not initialized.' });
@@ -412,20 +426,15 @@ app.post('/api/bookings', async (req, res) => {
     const startUTC = parseStartUTCFromBody(req.body);
 
     if (!userId || !serviceId || !locationId || !startUTC) {
-      return res.status(400).json({ error: 'Missing required booking information.' });
+      return res.status(400).json({ error: 'Missing required booking information (need userId, serviceId, locationId and {date,slot} or startTime).' });
     }
     if (['__proto__', 'constructor', 'prototype'].includes(String(locationId))) {
       return res.status(400).json({ error: 'Invalid locationId.' });
     }
 
-    startUTC.setSeconds(0, 0);
-
-    // Re-evaluate activeBays at this SAST date (same logic as verify)
+    // Re-evaluate active bays for that SAST date
     const startSAST = new Date(startUTC.getTime() + 120 * 60000);
-    const y = startSAST.getFullYear();
-    const m = String(startSAST.getMonth() + 1).padStart(2, '0');
-    const d = String(startSAST.getDate()).padStart(2, '0');
-    const dateKey = `${y}-${m}-${d}`;
+    const dateKey = `${startSAST.getFullYear()}-${pad2(startSAST.getMonth() + 1)}-${pad2(startSAST.getDate())}`;
 
     const settingsRef = db.collection('locations').doc(locationId).collection('settings');
     const [daily, global] = await Promise.all([
@@ -438,27 +447,29 @@ app.post('/api/bookings', async (req, res) => {
       2
     );
 
-    const existingAtThisStart = await db
+    // Guard again just before inserting
+    const existing = await db
       .collection('locations').doc(locationId).collection('bookings')
       .where('startTime', '==', startUTC)
       .get();
 
-    if (existingAtThisStart.size >= activeBays) {
+    if (existing.size >= activeBays) {
       return res.status(409).json({ error: 'Slot just became unavailable. Please choose another.' });
     }
 
-    // Create booking
     const newBooking = {
       userId,
       serviceId,
-      startTime: startUTC,       // Store canonical UTC
+      locationId,
+      startTime: startUTC,   // canonical UTC
       status: 'paid',
       createdAt: new Date(),
-      bayId: existingAtThisStart.size + 1,
+      bayId: existing.size + 1,
     };
+
     const docRef = await db.collection('locations').doc(locationId).collection('bookings').add(newBooking);
 
-    // Rewards update (unchanged from your original, with null-safety)
+    // Rewards (same logic, with null-safety)
     const userRef = db.collection('users').doc(userId);
     let userDoc = await userRef.get();
     if (!userDoc.exists) {
@@ -486,12 +497,20 @@ app.post('/api/bookings', async (req, res) => {
 
     await userRef.update({ [`rewards.${locationId}`]: locationRewards });
 
+    console.log('[create-booking]', {
+      bookingId: docRef.id,
+      locationId, dateKey,
+      startUTC: startUTC.toISOString(),
+      bayId: existing.size + 1
+    });
+
     return res.status(201).json({ message: 'Booking created successfully!', bookingId: docRef.id });
   } catch (error) {
     console.error('Error in /api/bookings:', error);
     return res.status(500).json({ error: 'Failed to create booking.' });
   }
 });
+
 
 app.post('/api/bookings/redeem-free-wash', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Database not initialized.' });
