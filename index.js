@@ -28,6 +28,9 @@ app.use(cors());
 app.use(express.json());
 const PORT = process.env.PORT || 3001;
 
+// THIS IS THE FIX: Trust the proxy from Render
+app.set('trust proxy', 1);
+
 // --- Paystack Credentials ---
 const PAYSTACK_SECRET_KEY = 'sk_test_c75e440a7b40c66a47a8ab73605ec0ac3cdbaece';
 const PAYSTACK_API_URL = 'https://api.paystack.co/transaction/initialize';
