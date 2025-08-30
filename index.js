@@ -1,4 +1,5 @@
 // index.js
+// index.js
 // ----- Imports -----
 const express = require('express');
 const cors = require('cors');
@@ -230,10 +231,10 @@ app.post('/api/bookings/verify-slot', async (req, res) => {
         
         res.status(200).send({ message: 'Slot is available.' });
     } catch (error) {
-        console.error("Error in /api/bookings/verify-slot:", error);
         res.status(500).send({ error: 'Failed to verify slot availability.' });
     }
 });
+
 
 app.post('/api/bookings', async (req, res) => {
     try {
@@ -310,11 +311,12 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
 
 // MANAGER ROUTES
 app.post('/api/assign-manager-role', isManager, async (req, res) => {
+    // This is a simplified version. A real app would have stricter controls.
     const { email } = req.body;
     try {
         const user = await admin.auth().getUserByEmail(email);
         await admin.auth().setCustomUserClaims(user.uid, { role: 'manager' });
-        // Also assign them to your location
+        // Also assign them to the location the assigning manager manages
         await db.collection('users').doc(user.uid).update({ managedLocationId: req.user.managedLocationId });
         res.status(200).send({ message: `Successfully assigned manager role to ${email}` });
     } catch (error) {
@@ -393,7 +395,7 @@ app.get('/api/manager/settings', isManager, async (req, res) => {
         if (dailySettingDoc.exists) { return res.status(200).send(dailySettingDoc.data()); }
         
         const globalSettingsDoc = await db.collection('locations').doc(locationId).collection('settings').doc('global').get();
-        if (!globalSettingsDoc.exists) { return res.status(200).send({ activeBays: 2 }); } // Default to 2
+        if (!globalSettingsDoc.exists) { return res.status(200).send({ activeBays: 2 }); }
         res.status(200).send(globalSettingsDoc.data());
     } catch (error) {
         res.status(500).send({ error: 'Failed to fetch settings.' });
