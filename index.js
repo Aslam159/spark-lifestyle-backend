@@ -28,7 +28,7 @@ app.use(cors());
 app.use(express.json());
 const PORT = process.env.PORT || 3001;
 
-// THIS IS THE FIX: Trust the proxy from Render
+// Trust the proxy from Render for rate limiting
 app.set('trust proxy', 1);
 
 // --- Paystack Credentials ---
@@ -62,7 +62,7 @@ const isManager = async (req, res, next) => {
     try {
         const decodedToken = await admin.auth().verifyIdToken(idToken);
         if (decodedToken.role === 'manager') {
-            req.user = decodedToken; // Add user info to the request object
+            req.user = decodedToken;
             const userProfile = await db.collection('users').doc(decodedToken.uid).get();
             if (userProfile.exists && userProfile.data().managedLocationId) {
                 req.user.managedLocationId = userProfile.data().managedLocationId;
@@ -91,7 +91,7 @@ app.post('/auth/signup', createAccountLimiter, async (req, res) => {
       email: userRecord.email,
       name: userRecord.displayName,
       role: 'customer',
-      rewards: {}, // Initialize empty rewards map
+      rewards: {},
     };
     await db.collection('users').doc(userRecord.uid).set(userProfile);
     res.status(201).send({ uid: userRecord.uid });
@@ -114,11 +114,11 @@ app.get('/api/services', async (req, res) => {
     const { locationId } = req.query;
     if (!locationId) { return res.status(400).send({ error: 'Location ID is required.' }); }
     try {
-        // UPDATED: Sort services by the 'displayOrder' field
         const servicesSnapshot = await db.collection('locations').doc(locationId).collection('services').where('isActive', '==', true).orderBy('displayOrder').get();
         const servicesList = servicesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         res.status(200).send(servicesList);
     } catch (error) {
+        console.error("Error in /api/services:", error);
         res.status(500).send({ error: 'Failed to fetch services.' });
     }
 });
@@ -176,7 +176,7 @@ app.get('/api/availability', async (req, res) => {
         }
         res.status(200).send(availableSlots);
     } catch (error) {
-        console.error("Error fetching availability:", error);
+        console.error("Error in /api/availability:", error);
         res.status(500).send({ error: 'Failed to fetch availability.' });
     }
 });
@@ -216,7 +216,6 @@ app.post('/api/bookings', async (req, res) => {
             return res.status(400).send({ error: 'Missing required booking information.' });
         }
         
-        // SECURITY FIX: Prevent Prototype Pollution
         if (locationId === '__proto__' || locationId === 'constructor' || locationId === 'prototype') {
             return res.status(400).send({ error: 'Invalid locationId.' });
         }
@@ -241,12 +240,7 @@ app.post('/api/bookings', async (req, res) => {
         const userDoc = await userRef.get();
         if (!userDoc.exists) {
             const userRecord = await admin.auth().getUser(userId);
-            const userProfile = {
-                email: userRecord.email,
-                name: userRecord.displayName,
-                role: 'customer',
-                rewards: {},
-            };
+            const userProfile = { email: userRecord.email, name: userRecord.displayName, role: 'customer', rewards: {} };
             await userRef.set(userProfile);
         }
 
@@ -265,7 +259,7 @@ app.post('/api/bookings', async (req, res) => {
         
         res.status(201).send({ message: 'Booking created successfully!', bookingId: docRef.id });
     } catch (error) {
-        console.error("Error creating booking:", error);
+        console.error("Error in /api/bookings:", error);
         res.status(500).send({ error: 'Failed to create booking.' });
     }
 });
@@ -287,7 +281,6 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
     }
 
     const correctUTCTime = subHours(new Date(startTime), 2);
-    // ... (Race condition check for free wash would go here)
     
     const newBooking = { userId, serviceId, startTime: correctUTCTime, status: 'free', createdAt: new Date(), bayId: 1 };
     await db.collection('locations').doc(locationId).collection('bookings').add(newBooking);
@@ -300,7 +293,6 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
 // MANAGER ROUTES
 app.post('/api/assign-manager-role', async (req, res) => {
     const { email } = req.body;
-    // In a real app, you'd want a super-admin check here
     try {
         const user = await admin.auth().getUserByEmail(email);
         await admin.auth().setCustomUserClaims(user.uid, { role: 'manager' });
@@ -381,7 +373,7 @@ app.get('/api/manager/settings', isManager, async (req, res) => {
         if (dailySettingDoc.exists) { return res.status(200).send(dailySettingDoc.data()); }
         
         const globalSettingsDoc = await db.collection('locations').doc(locationId).collection('settings').doc('global').get();
-        if (!globalSettingsDoc.exists) { return res.status(200).send({ activeBays: 1 }); } // Default to 1 if no global is set
+        if (!globalSettingsDoc.exists) { return res.status(200).send({ activeBays: 1 }); }
         res.status(200).send(globalSettingsDoc.data());
     } catch (error) {
         res.status(500).send({ error: 'Failed to fetch settings.' });
