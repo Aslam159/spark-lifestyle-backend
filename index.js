@@ -1,5 +1,4 @@
 // index.js
-// index.js
 // ----- Imports -----
 const express = require('express');
 const cors = require('cors');
@@ -102,7 +101,7 @@ app.post('/auth/signup', createAccountLimiter, async (req, res) => {
 
 app.get('/api/locations', async (req, res) => {
     try {
-        const locationsSnapshot = await db.collection('locations').get();
+        const locationsSnapshot = await db.collection('locations').orderBy('name').get();
         const locationsList = locationsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
         res.status(200).send(locationsList);
     } catch (error) {
@@ -133,7 +132,7 @@ app.get('/api/availability', async (req, res) => {
         const settingsRef = db.collection('locations').doc(locationId).collection('settings');
         const dailySettingDoc = await settingsRef.doc(date).get();
         const globalSettingsDoc = await settingsRef.doc('global').get();
-        const activeBays = dailySettingDoc.exists ? dailySettingDoc.data().activeBays : (globalSettingsDoc.exists ? globalSettingsDoc.data().activeBays : 1);
+        const activeBays = dailySettingDoc.exists ? dailySettingDoc.data().activeBays : (globalSettingsDoc.exists ? globalSettingsDoc.data().activeBays : 2);
 
         const startOfRequestedDay = startOfDay(requestedDate);
         const endOfRequestedDay = endOfDay(requestedDate);
@@ -209,6 +208,33 @@ app.get('/api/payments/verify/:reference', async (req, res) => {
     }
 });
 
+app.post('/api/bookings/verify-slot', async (req, res) => {
+    const { startTime, locationId } = req.body;
+    if (!startTime || !locationId) {
+        return res.status(400).send({ error: 'Missing information for verification.' });
+    }
+    try {
+        const correctUTCTime = subHours(new Date(startTime), 2);
+        const dateKey = format(correctUTCTime, 'yyyy-MM-dd');
+
+        const settingsRef = db.collection('locations').doc(locationId).collection('settings');
+        const dailySettingDoc = await settingsRef.doc(dateKey).get();
+        const globalSettingsDoc = await settingsRef.doc('global').get();
+        const activeBays = dailySettingDoc.exists ? dailySettingDoc.data().activeBays : (globalSettingsDoc.exists ? globalSettingsDoc.data().activeBays : 2);
+
+        const existingBookings = await db.collection('locations').doc(locationId).collection('bookings').where('startTime', '==', correctUTCTime).get();
+
+        if (existingBookings.size >= activeBays) {
+            return res.status(409).send({ error: 'Slot is no longer available.' });
+        }
+        
+        res.status(200).send({ message: 'Slot is available.' });
+    } catch (error) {
+        console.error("Error in /api/bookings/verify-slot:", error);
+        res.status(500).send({ error: 'Failed to verify slot availability.' });
+    }
+});
+
 app.post('/api/bookings', async (req, res) => {
     try {
         const { userId, serviceId, startTime, locationId } = req.body;
@@ -221,27 +247,19 @@ app.post('/api/bookings', async (req, res) => {
         }
         
         const correctUTCTime = subHours(new Date(startTime), 2);
-        const dateKey = format(correctUTCTime, 'yyyy-MM-dd');
-        
-        const settingsRef = db.collection('locations').doc(locationId).collection('settings');
-        const dailySettingDoc = await settingsRef.doc(dateKey).get();
-        const globalSettingsDoc = await settingsRef.doc('global').get();
-        const activeBays = dailySettingDoc.exists ? dailySettingDoc.data().activeBays : (globalSettingsDoc.exists ? globalSettingsDoc.data().activeBays : 1);
         
         const existingBookings = await db.collection('locations').doc(locationId).collection('bookings').where('startTime', '==', correctUTCTime).get();
-        if (existingBookings.size >= activeBays) {
-            return res.status(409).send({ error: 'Sorry, this time slot was just taken. Please select another time.' });
-        }
-        
+
         const newBooking = { userId, serviceId, startTime: correctUTCTime, status: 'paid', createdAt: new Date(), bayId: (existingBookings.size + 1) };
         const docRef = await db.collection('locations').doc(locationId).collection('bookings').add(newBooking);
         
         const userRef = db.collection('users').doc(userId);
-        const userDoc = await userRef.get();
+        let userDoc = await userRef.get();
         if (!userDoc.exists) {
             const userRecord = await admin.auth().getUser(userId);
             const userProfile = { email: userRecord.email, name: userRecord.displayName, role: 'customer', rewards: {} };
             await userRef.set(userProfile);
+            userDoc = await userRef.get();
         }
 
         const currentRewards = userDoc.data()?.rewards || {};
@@ -291,11 +309,13 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
 });
 
 // MANAGER ROUTES
-app.post('/api/assign-manager-role', async (req, res) => {
+app.post('/api/assign-manager-role', isManager, async (req, res) => {
     const { email } = req.body;
     try {
         const user = await admin.auth().getUserByEmail(email);
         await admin.auth().setCustomUserClaims(user.uid, { role: 'manager' });
+        // Also assign them to your location
+        await db.collection('users').doc(user.uid).update({ managedLocationId: req.user.managedLocationId });
         res.status(200).send({ message: `Successfully assigned manager role to ${email}` });
     } catch (error) {
         res.status(500).send({ error: error.message });
@@ -373,7 +393,7 @@ app.get('/api/manager/settings', isManager, async (req, res) => {
         if (dailySettingDoc.exists) { return res.status(200).send(dailySettingDoc.data()); }
         
         const globalSettingsDoc = await db.collection('locations').doc(locationId).collection('settings').doc('global').get();
-        if (!globalSettingsDoc.exists) { return res.status(200).send({ activeBays: 1 }); }
+        if (!globalSettingsDoc.exists) { return res.status(200).send({ activeBays: 2 }); } // Default to 2
         res.status(200).send(globalSettingsDoc.data());
     } catch (error) {
         res.status(500).send({ error: 'Failed to fetch settings.' });
@@ -431,4 +451,3 @@ app.post('/api/manager/blocked-slots', isManager, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is now listening on port ${PORT}`);
 });
-
