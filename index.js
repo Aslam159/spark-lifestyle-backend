@@ -18,6 +18,29 @@ const {
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
 
+// ---------- Time helpers (SAST-aware) ----------
+function parseStartUTCFromBody(body) {
+  // Accept either { date:'yyyy-MM-dd', slot:'HH:mm' } OR { startTime: ISOish string }
+  if (body?.date && body?.slot) {
+    // Interpret as SAST and convert to UTC
+    // Example: '2025-08-30' + '09:15' => '2025-08-30T09:15:00+02:00' (SAST)
+    return new Date(`${body.date}T${body.slot}:00+02:00`);
+  }
+  if (body?.startTime) {
+    const st = String(body.startTime).replace(' ', 'T');
+    // If already has Z or an offset, trust it; else treat as SAST
+    if (/[zZ]|[+\-]\d\d:\d\d$/.test(st)) return new Date(st);
+    return new Date(`${st}+02:00`);
+  }
+  return null;
+}
+
+function clampActiveBays(val, fallback = 2) {
+  const n = Number(val);
+  if (!Number.isFinite(n)) return Math.max(1, fallback);
+  return Math.max(1, n); // never 0
+}
+
 // ----- Firebase Configuration -----
 let db;
 try {
@@ -330,44 +353,54 @@ app.get('/api/availability', async (req, res) => {
 app.post('/api/bookings/verify-slot', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Database not initialized.' });
 
-  const { startTime, locationId } = req.body || {};
-  if (!startTime || !locationId) {
-    return res.status(400).json({ error: 'Missing information for verification.' });
-  }
-  if (['__proto__', 'constructor', 'prototype'].includes(String(locationId))) {
-    return res.status(400).json({ error: 'Invalid locationId.' });
-  }
-
   try {
-    const correctUTCTime = subHours(new Date(startTime), 2);
-    const dateKey = format(correctUTCTime, 'yyyy-MM-dd');
+    const { locationId } = req.body || {};
+    const startUTC = parseStartUTCFromBody(req.body);
+
+    if (!locationId || !startUTC) {
+      return res.status(400).json({ error: 'Missing or invalid locationId / start time.' });
+    }
+    if (['__proto__', 'constructor', 'prototype'].includes(String(locationId))) {
+      return res.status(400).json({ error: 'Invalid locationId.' });
+    }
+
+    // Normalize to minute precision so Firestore equality matches exactly
+    startUTC.setSeconds(0, 0);
+
+    // Figure out the SAST date key for settings (yyyy-MM-dd)
+    const startSAST = new Date(startUTC.getTime() + 120 * 60000);
+    const y = startSAST.getFullYear();
+    const m = String(startSAST.getMonth() + 1).padStart(2, '0');
+    const d = String(startSAST.getDate()).padStart(2, '0');
+    const dateKey = `${y}-${m}-${d}`;
 
     const settingsRef = db.collection('locations').doc(locationId).collection('settings');
-    const [dailySettingDoc, globalSettingsDoc] = await Promise.all([
+    const [daily, global] = await Promise.all([
       settingsRef.doc(dateKey).get(),
       settingsRef.doc('global').get(),
     ]);
 
-    const activeBays =
-      (dailySettingDoc.exists && dailySettingDoc.data()?.activeBays) ??
-      (globalSettingsDoc.exists && globalSettingsDoc.data()?.activeBays) ??
-      2;
+    // IMPORTANT: clamp to >=1 so "0" never blocks every slot
+    const activeBays = clampActiveBays(
+      (daily.exists && daily.data()?.activeBays) ??
+      (global.exists && global.data()?.activeBays) ??
+      2
+    );
 
+    // Count bookings that start at exactly the same start time
     const existingBookings = await db
-      .collection('locations')
-      .doc(locationId)
-      .collection('bookings')
-      .where('startTime', '==', correctUTCTime)
+      .collection('locations').doc(locationId).collection('bookings')
+      .where('startTime', '==', startUTC)
       .get();
 
     if (existingBookings.size >= activeBays) {
       return res.status(409).json({ error: 'Slot is no longer available.' });
     }
 
-    res.status(200).json({ message: 'Slot is available.' });
+    return res.status(200).json({ message: 'Slot is available.' });
   } catch (error) {
     console.error('Error in /api/bookings/verify-slot:', error);
-    res.status(500).json({ error: 'Failed to verify slot availability.' });
+    return res.status(500).json({ error: 'Failed to verify slot availability.' });
   }
 });
 
@@ -375,32 +408,57 @@ app.post('/api/bookings', async (req, res) => {
   if (!db) return res.status(500).json({ error: 'Database not initialized.' });
 
   try {
-    const { userId, serviceId, startTime, locationId } = req.body || {};
-    if (!userId || !serviceId || !startTime || !locationId) {
+    const { userId, serviceId, locationId } = req.body || {};
+    const startUTC = parseStartUTCFromBody(req.body);
+
+    if (!userId || !serviceId || !locationId || !startUTC) {
       return res.status(400).json({ error: 'Missing required booking information.' });
     }
     if (['__proto__', 'constructor', 'prototype'].includes(String(locationId))) {
       return res.status(400).json({ error: 'Invalid locationId.' });
     }
 
-    const correctUTCTime = subHours(new Date(startTime), 2);
-    const existingBookings = await db
-      .collection('locations')
-      .doc(locationId)
-      .collection('bookings')
-      .where('startTime', '==', correctUTCTime)
+    startUTC.setSeconds(0, 0);
+
+    // Re-evaluate activeBays at this SAST date (same logic as verify)
+    const startSAST = new Date(startUTC.getTime() + 120 * 60000);
+    const y = startSAST.getFullYear();
+    const m = String(startSAST.getMonth() + 1).padStart(2, '0');
+    const d = String(startSAST.getDate()).padStart(2, '0');
+    const dateKey = `${y}-${m}-${d}`;
+
+    const settingsRef = db.collection('locations').doc(locationId).collection('settings');
+    const [daily, global] = await Promise.all([
+      settingsRef.doc(dateKey).get(),
+      settingsRef.doc('global').get(),
+    ]);
+    const activeBays = clampActiveBays(
+      (daily.exists && daily.data()?.activeBays) ??
+      (global.exists && global.data()?.activeBays) ??
+      2
+    );
+
+    const existingAtThisStart = await db
+      .collection('locations').doc(locationId).collection('bookings')
+      .where('startTime', '==', startUTC)
       .get();
 
+    if (existingAtThisStart.size >= activeBays) {
+      return res.status(409).json({ error: 'Slot just became unavailable. Please choose another.' });
+    }
+
+    // Create booking
     const newBooking = {
       userId,
       serviceId,
-      startTime: correctUTCTime,
+      startTime: startUTC,       // Store canonical UTC
       status: 'paid',
       createdAt: new Date(),
-      bayId: existingBookings.size + 1,
+      bayId: existingAtThisStart.size + 1,
     };
     const docRef = await db.collection('locations').doc(locationId).collection('bookings').add(newBooking);
 
+    // Rewards update (unchanged from your original, with null-safety)
     const userRef = db.collection('users').doc(userId);
     let userDoc = await userRef.get();
     if (!userDoc.exists) {
@@ -428,10 +486,10 @@ app.post('/api/bookings', async (req, res) => {
 
     await userRef.update({ [`rewards.${locationId}`]: locationRewards });
 
-    res.status(201).json({ message: 'Booking created successfully!', bookingId: docRef.id });
+    return res.status(201).json({ message: 'Booking created successfully!', bookingId: docRef.id });
   } catch (error) {
     console.error('Error in /api/bookings:', error);
-    res.status(500).json({ error: 'Failed to create booking.' });
+    return res.status(500).json({ error: 'Failed to create booking.' });
   }
 });
 
