@@ -38,14 +38,14 @@ const PAYSTACK_VERIFY_URL = 'https://api.paystack.co/transaction/verify/';
 
 // --- SECURITY: Rate Limiter ---
 const apiLimiter = rateLimit({
-	windowMs: 15 * 60 * 1000,
-	max: 100,
+	windowMs: 15 * 60 * 1000, // 15 minutes
+	max: 100, // Limit each IP to 100 requests per window
 	standardHeaders: true,
 	legacyHeaders: false,
 });
 const createAccountLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 10,
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 10, // Limit each IP to 10 accounts per hour
     message: 'Too many accounts created from this IP, please try again after an hour',
     standardHeaders: true,
     legacyHeaders: false,
@@ -211,9 +211,7 @@ app.get('/api/payments/verify/:reference', async (req, res) => {
 
 app.post('/api/bookings/verify-slot', async (req, res) => {
     const { startTime, locationId } = req.body;
-    if (!startTime || !locationId) {
-        return res.status(400).send({ error: 'Missing information for verification.' });
-    }
+    if (!startTime || !locationId) { return res.status(400).send({ error: 'Missing information for verification.' }); }
     try {
         const correctUTCTime = subHours(new Date(startTime), 2);
         const dateKey = format(correctUTCTime, 'yyyy-MM-dd');
@@ -235,17 +233,12 @@ app.post('/api/bookings/verify-slot', async (req, res) => {
     }
 });
 
-
 app.post('/api/bookings', async (req, res) => {
     try {
         const { userId, serviceId, startTime, locationId } = req.body;
-        if (!userId || !serviceId || !startTime || !locationId) {
-            return res.status(400).send({ error: 'Missing required booking information.' });
-        }
+        if (!userId || !serviceId || !startTime || !locationId) { return res.status(400).send({ error: 'Missing required booking information.' }); }
         
-        if (locationId === '__proto__' || locationId === 'constructor' || locationId === 'prototype') {
-            return res.status(400).send({ error: 'Invalid locationId.' });
-        }
+        if (locationId === '__proto__' || locationId === 'constructor' || locationId === 'prototype') { return res.status(400).send({ error: 'Invalid locationId.' }); }
         
         const correctUTCTime = subHours(new Date(startTime), 2);
         
@@ -311,12 +304,10 @@ app.post('/api/bookings/redeem-free-wash', async (req, res) => {
 
 // MANAGER ROUTES
 app.post('/api/assign-manager-role', isManager, async (req, res) => {
-    // This is a simplified version. A real app would have stricter controls.
     const { email } = req.body;
     try {
         const user = await admin.auth().getUserByEmail(email);
         await admin.auth().setCustomUserClaims(user.uid, { role: 'manager' });
-        // Also assign them to the location the assigning manager manages
         await db.collection('users').doc(user.uid).update({ managedLocationId: req.user.managedLocationId });
         res.status(200).send({ message: `Successfully assigned manager role to ${email}` });
     } catch (error) {
